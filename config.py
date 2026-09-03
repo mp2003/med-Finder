@@ -1,13 +1,19 @@
 """Owner-editable constants. Presets carry city AND pincode: 1mg keys on city,
 Apollo keys on pincode."""
 
+# Delivery destinations -- the pharmacy branches and office we order TO, not
+# generic neighbourhoods. Every pincode below was confirmed against 1mg's own
+# latlng resolver (it returned the same one the postal address carries), and
+# Blinkit was verified serving all three.
+#
 # name, lat, lon, pincode, city  ("Bangalore" is 1mg's spelling, not "Bengaluru")
 PRESETS = [
-    {"name": "Koramangala", "lat": 12.9352, "lon": 77.6245, "pincode": "560034", "city": "Bangalore"},
-    {"name": "Indiranagar", "lat": 12.9719, "lon": 77.6412, "pincode": "560038", "city": "Bangalore"},
-    {"name": "HSR Layout",  "lat": 12.9116, "lon": 77.6446, "pincode": "560102", "city": "Bangalore"},
-    {"name": "Whitefield",  "lat": 12.9698, "lon": 77.7500, "pincode": "560066", "city": "Bangalore"},
-    {"name": "Jayanagar",   "lat": 12.9308, "lon": 77.5838, "pincode": "560041", "city": "Bangalore"},
+    {"name": "UrMedz Gateway", "lat": 13.011895167526944, "lon": 77.55668878203804,
+     "pincode": "560055", "city": "Bangalore"},      # Brigade Gateway, Malleshwaram
+    {"name": "UrMedz Metropolis", "lat": 12.989707130253173, "lon": 77.7026712127195,
+     "pincode": "560048", "city": "Bangalore"},      # Brigade Metropolis, Mahadevapura
+    {"name": "1Pharmacy Office", "lat": 13.013148753446263, "lon": 77.54302298203808,
+     "pincode": "560096", "city": "Bangalore"},      # Nandini Layout
 ]
 
 DB_PATH = "bot.db"
