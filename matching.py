@@ -11,6 +11,7 @@ Two traps, both confirmed against live platform data:
 import re
 
 from rapidfuzz import fuzz
+from rapidfuzz.distance import Levenshtein
 
 
 def normalize(s: str) -> str:
@@ -66,5 +67,31 @@ def identity_ok(query: str, title: str) -> bool:
             if tok not in words:
                 return False
         elif tok not in t:
+            return False
+    return True
+
+
+def typo_ok(query: str, title: str) -> bool:
+    """True when every identifying token is within one edit of a title word.
+
+    identity_ok() demands exact containment, so a single mistyped letter --
+    "BIODEMS-F" for the real "BIODENS-F" -- reports not-found on the very
+    product the user wanted.
+
+    Score cannot separate these: token_set_ratio rewards the shared generic
+    words, so a wrong brand ("O3+ Brightening Face Wash" for a Cristello query)
+    scores 91.3 while a real typo match scores 70.8. Edit distance on the
+    IDENTIFYING tokens does separate them, because a typo is one letter off the
+    brand while a wrong brand is a different word entirely.
+
+    Digits must still match exactly: 650 and 500 are one edit apart but are
+    different products.
+    """
+    words = set(normalize(title).split())
+    for tok in key_tokens(query):
+        if tok.isdigit():
+            if tok not in words:
+                return False
+        elif not any(Levenshtein.distance(tok, w) <= 1 for w in words):
             return False
     return True

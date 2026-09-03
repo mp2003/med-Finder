@@ -64,6 +64,42 @@ def to_float(v) -> float | None:
     return float(m.group()) if m else None
 
 
+# Sorts last: an unknown ETA must never outrank a known one.
+ETA_UNKNOWN = 10 ** 6
+
+
+def eta_minutes(eta: str | None) -> int:
+    """Best-effort delivery time in minutes, for ranking only.
+
+    Every platform words this differently -- '45 mins', 'Get by 7pm, Tomorrow',
+    'Delivery by Tue, 2 Sep'. We only need a comparable number, so a same-day
+    phrase collapses to a nominal few hours and anything dated to tomorrow or
+    later sorts behind it. Returns ETA_UNKNOWN when nothing is parseable, which
+    keeps unknown ETAs at the bottom instead of silently winning.
+    """
+    if not eta:
+        return ETA_UNKNOWN
+    s = eta.lower()
+    m = re.search(r"(\d+)\s*(min|hour|hr|day)", s)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        mult = {"min": 1, "hour": 60, "hr": 60, "day": 1440}[unit]
+        return n * mult
+    # Quick-commerce delivery classes carry no number but are the fastest thing
+    # here; rank them ahead of any dated delivery without claiming a minute
+    # count. Blinkit's eta_identifier varies by store ("express" at one branch,
+    # "unicorn" at another), so match its vocabulary, not just one value.
+    if any(w in s for w in ("express", "instant", "earliest", "unicorn",
+                            "superfast", "rocket", "flash")):
+        return 15
+    # No explicit number: fall back to the day words these strings all use.
+    if "tomorrow" in s:
+        return 1440
+    if "today" in s or "tonight" in s:
+        return 240
+    return ETA_UNKNOWN
+
+
 def top_matches(query: str, results: list[ProductResult]) -> list[ProductResult]:
     """Real matches first (identity gate + score cutoff), then similar items as
     a labelled fallback.
