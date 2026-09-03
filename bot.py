@@ -105,6 +105,25 @@ async def unknown_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Unknown command — try /help")
 
 
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log one line instead of a full traceback, and tell the user.
+
+    Without this, python-telegram-bot dumps the whole stack for every blip --
+    a dropped wifi connection while polling filled the log with ~30 lines of
+    httpx internals. Adapters already swallow their own failures, so anything
+    reaching here is the bot itself: a network drop or a Telegram API error.
+    """
+    err = ctx.error
+    log.error("handler error: %s: %s", type(err).__name__, err)
+    # Best effort -- if the failure WAS the network, this send fails too.
+    chat = getattr(update, "effective_chat", None)
+    if chat:
+        try:
+            await chat.send_message("Something went wrong — please try again.")
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------- location
 async def on_preset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -340,6 +359,7 @@ def main():
     app.add_handler(MessageHandler(filters.LOCATION, on_live_location))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ask_urgency))
+    app.add_error_handler(on_error)
     log.info("MedFinder up — polling…")
     app.run_polling()
 
