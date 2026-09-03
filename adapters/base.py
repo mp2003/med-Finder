@@ -21,6 +21,10 @@ class Location:
     lon: float
     pincode: str
     city: str
+    # Instamart's dark-store id. It cannot be derived from lat/lon without a
+    # handshake we have not cracked, so presets carry it explicitly. None for a
+    # shared live location, where the adapter falls back to its default store.
+    im_store: str | None = None
 
 
 @dataclass

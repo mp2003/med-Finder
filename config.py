@@ -6,14 +6,23 @@ Apollo keys on pincode."""
 # latlng resolver (it returned the same one the postal address carries), and
 # Blinkit was verified serving all three.
 #
-# name, lat, lon, pincode, city  ("Bangalore" is 1mg's spelling, not "Bengaluru")
+# im_store is Instamart's dark-store id, captured per branch from its own web
+# app (set the address, then read storeId= out of any request). It cannot be
+# resolved from lat/lon, so it is recorded here. Re-capture if a branch starts
+# returning stock that does not match the app -- Instamart reassigns stores.
+#
+# name, lat, lon, pincode, city, im_store
+#   ("Bangalore" is 1mg's spelling, not "Bengaluru")
 PRESETS = [
     {"name": "UrMedz Gateway", "lat": 13.011895167526944, "lon": 77.55668878203804,
-     "pincode": "560055", "city": "Bangalore"},      # Brigade Gateway, Malleshwaram
+     "pincode": "560055", "city": "Bangalore",       # Brigade Gateway, Malleshwaram
+     "im_store": "1396467"},
     {"name": "UrMedz Metropolis", "lat": 12.989707130253173, "lon": 77.7026712127195,
-     "pincode": "560048", "city": "Bangalore"},      # Brigade Metropolis, Mahadevapura
+     "pincode": "560048", "city": "Bangalore",       # Brigade Metropolis, Mahadevapura
+     "im_store": "1404967"},
     {"name": "1Pharmacy Office", "lat": 13.013148753446263, "lon": 77.54302298203808,
-     "pincode": "560096", "city": "Bangalore"},      # Nandini Layout
+     "pincode": "560096", "city": "Bangalore",       # Nandini Layout
+     "im_store": "1404884"},
 ]
 
 DB_PATH = "bot.db"

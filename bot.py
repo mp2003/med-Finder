@@ -129,7 +129,8 @@ async def on_preset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     p = PRESETS[int(q.data.split(":")[1])]
-    loc = Location(p["name"], p["lat"], p["lon"], p["pincode"], p["city"])
+    loc = Location(p["name"], p["lat"], p["lon"], p["pincode"], p["city"],
+                   p.get("im_store"))
     await db.set_location(q.message.chat_id, loc)
     await q.edit_message_text(
         f"✅ Location set: <b>{html.escape(loc.name)}</b> — {loc.pincode}\n"

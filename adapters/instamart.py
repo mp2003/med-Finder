@@ -11,10 +11,12 @@ What IS real is aggressive, non-deterministic rate limiting: a 200 carrying
 {"statusCode": 429} and a ~31 byte body. Treated as "no results" rather than an
 error, since the bot's cache absorbs it.
 
-Store caveat: storeId picks the dark store, and resolving one from lat/lon
-needs a separate handshake we have not cracked, so DEFAULT_STORE (Bengaluru)
-is used for every location. Prices and stock are therefore that store's, not
-the user's -- so this platform's availability is NOT location-accurate yet.
+Store handling: storeId picks the dark store and cannot be derived from
+lat/lon, so each preset carries its own (captured from Instamart's web app and
+recorded in config.PRESETS). Stock and prices are then genuinely that branch's
+-- the same query returned Double Masala at Rs 75 from one store and Rs 120
+from another. A shared live location has no store id and falls back to
+DEFAULT_STORE, where availability is approximate.
 """
 import asyncio
 import json
@@ -74,8 +76,11 @@ async def search(query: str, loc: Location) -> list[ProductResult]:
             "page_type": "INSTAMART_AUTO_SUGGEST_PAGE",
             "is_pre_search_tag": False,
         })
+        # Presets carry the branch's own dark store; a shared live location
+        # has none, so fall back rather than returning nothing.
+        store = loc.im_store or DEFAULT_STORE
         params = {"offset": 0, "ageConsent": "false", "layoutId": 4987,
-                  "storeId": DEFAULT_STORE, "primaryStoreId": DEFAULT_STORE,
+                  "storeId": store, "primaryStoreId": store,
                   "secondaryStoreId": ""}
         async with cffi.AsyncSession() as s:
             r = await s.post(SEARCH_URL, headers=headers, params=params,
