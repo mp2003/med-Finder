@@ -5,12 +5,16 @@ import importlib
 # Verified working against live endpoints (2026-08-26).
 #   Pharmacy: 1mg, Apollo, PharmEasy, Netmeds
 #   FMCG:     DMart
-_LIVE = ("onemg", "apollo", "pharmeasy", "netmeds", "dmart")
+#   Quick-commerce: Blinkit, Instamart -- both need curl_cffi. Blinkit is
+#                   blocked on TLS fingerprint; Instamart's *website* sits
+#                   behind an AWS WAF challenge but its API does not.
+_LIVE = ("onemg", "apollo", "pharmeasy", "netmeds", "dmart", "blinkit",
+         "instamart")
 
 # Reachable-but-unbuilt (BigBasket/JioMart need a handshake or bundle-grep) and
-# hard-blocked (Blinkit 403, Zepto/Instamart 202-empty). Rendered as
-# "coming soon" rather than a misleading "not found".
-_SOON = ("bigbasket", "jiomart", "blinkit")
+# Zepto, whose site AND api host are both behind the AWS WAF challenge.
+# Rendered as "coming soon" rather than a misleading "not found".
+_SOON = ("bigbasket", "jiomart", "zepto")
 
 
 def _load(names):

@@ -3,3 +3,5 @@ httpx
 rapidfuzz
 aiosqlite
 python-dotenv
+# Blinkit + Instamart: replays Chrome's TLS fingerprint, which httpx cannot do.
+curl_cffi
