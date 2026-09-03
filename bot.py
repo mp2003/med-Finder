@@ -10,17 +10,18 @@ import sys
 import time
 
 from dotenv import load_dotenv
-from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
-                      ReplyKeyboardMarkup, ReplyKeyboardRemove, Update)
+from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
+                      KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+                      Update)
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
 import db
 from adapters import ADAPTERS, COMING_SOON
-from adapters.base import Location, ProductResult
+from adapters.base import Location, ProductResult, eta_minutes
 from adapters.onemg import resolve_latlng
 from config import CACHE_TTL, PRESETS, SEARCH_BUDGET
-from matching import normalize
+from matching import normalize, typo_ok
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                     level=logging.INFO)
@@ -136,11 +137,30 @@ async def on_live_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------- search
-def render(query: str, loc: Location, done: dict, cached: bool) -> str:
+def _rank(mod, done: dict, urgent: bool):
+    """Sort key: best line first, by ETA when urgent, else by price.
+
+    Platforms still being checked, or with nothing to show, sort to the bottom
+    so the board's top line is always an answer rather than a spinner.
+    """
+    results = done.get(mod.PLATFORM)
+    if not results:
+        return (2, 0, 0)
+    r = results[0]
+    if not (r.is_match and r.available):
+        return (1, 0, 0)
+    price = r.price if r.price is not None else float("inf")
+    eta = eta_minutes(r.eta)
+    return (0, eta, price) if urgent else (0, price, eta)
+
+
+def render(query: str, loc: Location, done: dict, cached: bool,
+           urgent: bool = False) -> str:
     head = (f"🔎 <b>{html.escape(query)}</b> — {html.escape(loc.name)} "
             f"({loc.pincode})")
+    head += ("\n<i>fastest first</i>" if urgent else "\n<i>cheapest first</i>")
     lines = []
-    for mod in ADAPTERS:
+    for mod in sorted(ADAPTERS, key=lambda m: _rank(m, done, urgent)):
         name = html.escape(mod.PLATFORM)
         if mod.PLATFORM not in done:
             lines.append(f"⏳ {name} — checking…")
@@ -156,7 +176,14 @@ def render(query: str, loc: Location, done: dict, cached: bool) -> str:
                     f'{html.escape(r.name)}</a>')
             price = f"₹{r.price:g}" if r.price is not None else "price n/a"
             eta = f" ({html.escape(r.eta)})" if r.eta else ""
-            if not r.is_match:
+            if not r.is_match and typo_ok(query, r.name):
+                # Failed the identity gate, but every identifying token is one
+                # edit from the title -- a mistyped query, not a different
+                # product. Still not asserted as a match: the user confirms by
+                # reading the name.
+                lines.append(f"❓ {name} — did you mean {link}? — "
+                             f"{price}{eta}")
+            elif not r.is_match:
                 # No real match: say so plainly, then offer the closest item.
                 lines.append(f"❌ {name} — not found. Similar: {link} — "
                              f"{price}{eta}")
@@ -169,19 +196,18 @@ def render(query: str, loc: Location, done: dict, cached: bool) -> str:
                                  f'<a href="{html.escape(alt.url, quote=True)}">'
                                  f'{html.escape(alt.name)}</a> — {ap}')
             else:
-                lines.append(f"✅ {name} — {price}{eta} — {link}")
+                # Be explicit when a platform gives no ETA: under "fastest
+                # first" a silent omission reads as fast, which it is not.
+                shown = eta or (" (delivery time n/a)" if urgent else "")
+                lines.append(f"✅ {name} — {price}{shown} — {link}")
     for mod in COMING_SOON:
         lines.append(f"⚠️ {html.escape(mod.PLATFORM)} — coming soon")
     foot = "\n\n<i>cached</i>" if cached else ""
     return head + "\n" + "\n".join(lines) + foot
 
 
-async def do_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Default handler: treat plain text as a product search.
-
-    Serves from cache when fresh, else fans out to every live adapter and
-    edits the placeholder message as each one lands.
-    """
+async def ask_urgency(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Plain text = a product name. Ask how to rank before searching."""
     query = (update.message.text or "").strip()
     if not query:
         return
@@ -189,17 +215,50 @@ async def do_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not loc:
         return await ask_location(update, "Pick a location first.\n")
 
+    # Keyed per chat so a second search cannot answer the first one's prompt.
+    ctx.user_data["pending_query"] = query
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🚨 Yes — need it fast", callback_data="urg:1"),
+        InlineKeyboardButton("💰 No — cheapest", callback_data="urg:0"),
+    ]])
+    await update.message.reply_text(
+        f"🔎 <b>{html.escape(query)}</b>\nIs it needed urgently?",
+        reply_markup=kb, parse_mode="HTML")
+
+
+async def on_urgency(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Urgency answered -> run the search with that ranking."""
+    q = update.callback_query
+    await q.answer()
+    query = ctx.user_data.pop("pending_query", None)
+    if not query:
+        return await q.edit_message_text("That search expired — send the name again.")
+    await q.edit_message_reply_markup(reply_markup=None)
+    await do_search(q.message, query, update.effective_chat.id,
+                    urgent=q.data == "urg:1")
+
+
+async def do_search(message, query: str, chat_id: int, urgent: bool):
+    """Fan out to every live adapter and edit the board as each one lands.
+
+    Serves from cache when fresh. Takes an explicit message/query rather than
+    an Update, since it is driven by the urgency callback, not a raw message.
+    """
+    loc = await db.get_location(chat_id)
+    if not loc:
+        return
+
     key = (normalize(query), loc.pincode)
     hit = _cache.get(key)
     if hit and time.time() - hit[1] < CACHE_TTL:
         done = {m.PLATFORM: [r for r in hit[0] if r.platform == m.PLATFORM]
                 for m in ADAPTERS}
-        return await update.message.reply_text(
-            render(query, loc, done, cached=True), parse_mode="HTML",
-            disable_web_page_preview=True)
+        return await message.reply_text(
+            render(query, loc, done, cached=True, urgent=urgent),
+            parse_mode="HTML", disable_web_page_preview=True)
 
-    msg = await update.message.reply_text(
-        render(query, loc, {}, cached=False), parse_mode="HTML",
+    msg = await message.reply_text(
+        render(query, loc, {}, cached=False, urgent=urgent), parse_mode="HTML",
         disable_web_page_preview=True)
 
     done: dict[str, list | None] = {}
@@ -222,8 +281,9 @@ async def do_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 log.warning("%s task failed: %s", mod.PLATFORM, e)
                 done[mod.PLATFORM] = None
         try:  # progressive edit; ignore "message is not modified"
-            await msg.edit_text(render(query, loc, done, cached=False),
-                                parse_mode="HTML", disable_web_page_preview=True)
+            await msg.edit_text(
+                render(query, loc, done, cached=False, urgent=urgent),
+                parse_mode="HTML", disable_web_page_preview=True)
         except Exception:
             pass
 
@@ -235,13 +295,31 @@ async def do_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if ok:
         _cache[key] = (ok, time.time())
     try:
-        await msg.edit_text(render(query, loc, done, cached=False),
-                            parse_mode="HTML", disable_web_page_preview=True)
+        await msg.edit_text(
+            render(query, loc, done, cached=False, urgent=urgent),
+            parse_mode="HTML", disable_web_page_preview=True)
     except Exception:
         pass
 
 
 # ---------------------------------------------------------------- main
+# Shown in Telegram's blue Menu button and command autocomplete. Registering
+# handlers is NOT enough -- Telegram only lists what is set here. Keep this in
+# step with the CommandHandlers below.
+COMMANDS = [
+    BotCommand("start", "Set up and pick a delivery location"),
+    BotCommand("location", "Change delivery location"),
+    BotCommand("where", "Show the saved location"),
+    BotCommand("help", "How this works"),
+]
+
+
+async def post_init(app: Application) -> None:
+    """Open the SQLite store and publish the command menu."""
+    await db.init()
+    await app.bot.set_my_commands(COMMANDS)
+
+
 def main():
     load_dotenv()
     token = (os.getenv("BOT_TOKEN") or "").strip().strip('"\'')
@@ -252,16 +330,16 @@ def main():
         sys.exit(f"BOT_TOKEN looks malformed ({token[:6]}...). Expected "
                  "<digits>:<letters>, e.g. 8123456789:AAF...")
 
-    app = Application.builder().token(token).post_init(
-        lambda _: db.init()).build()
+    app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("location", cmd_location))
     app.add_handler(CommandHandler("where", cmd_where))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(on_preset, pattern=r"^loc:"))
+    app.add_handler(CallbackQueryHandler(on_urgency, pattern=r"^urg:"))
     app.add_handler(MessageHandler(filters.LOCATION, on_live_location))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, do_search))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ask_urgency))
     log.info("MedFinder up — polling…")
     app.run_polling()
 
