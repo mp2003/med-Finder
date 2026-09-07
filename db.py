@@ -1,5 +1,6 @@
 """SQLite persistence: one saved location per chat. Survives bot restarts."""
 import datetime
+import os
 
 import aiosqlite
 
@@ -35,6 +36,17 @@ CREATE TABLE IF NOT EXISTS picks (
 
 async def init():
     """Create the users table if absent, and add columns older DBs lack."""
+    # SQLite creates a missing FILE but never a missing DIRECTORY, so a
+    # DB_PATH pointing at an unmounted volume fails with a bare "unable to
+    # open database file" -- from a crash loop, five times a second, with no
+    # hint that the fix is a volume mount rather than anything in the code.
+    parent = os.path.dirname(os.path.abspath(DB_PATH))
+    if not os.path.isdir(parent):
+        raise SystemExit(
+            f"DB_PATH is {DB_PATH!r} but {parent!r} does not exist.\n"
+            "  On Railway/Fly: add a VOLUME mounted at that path -- setting\n"
+            "  the variable alone is not enough, the directory has to exist.\n"
+            "  Locally: use a relative path, e.g. DB_PATH=bot.db")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(_SCHEMA)
         await db.execute(_PICKS_SCHEMA)
