@@ -1195,6 +1195,17 @@ def main():
                  "<digits>:<letters>, e.g. 8123456789:AAF...")
     if dev:
         log.info("DEV MODE — using DEV_BOT_TOKEN, db=%s", DB_PATH)
+    # Checked HERE, before the Application exists: db.init() runs inside
+    # post_init, where an exception is reported by the framework long after
+    # "MedFinder up" and is easy to miss entirely. A misconfigured volume
+    # should fail on line one, next to the BOT_TOKEN check.
+    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    if not os.path.isdir(db_dir):
+        sys.exit(f"DB_PATH is {DB_PATH!r} but the directory {db_dir!r} does "
+                 "not exist.\n"
+                 "  On a host (Railway/Fly): add a VOLUME mounted at that\n"
+                 "  path -- setting the variable alone is not enough.\n"
+                 "  Locally: use a relative path, e.g. DB_PATH=bot.db")
 
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
