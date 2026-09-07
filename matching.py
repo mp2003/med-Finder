@@ -130,6 +130,41 @@ def typo_ok(query: str, title: str) -> bool:
     return True
 
 
+def respell(query: str, titles: list[str]) -> str | None:
+    """The query rewritten using the platforms' own spelling, or None.
+
+    "paracitamol" comes back from 1mg as "Paracetamol 500mg Tablet" -- the
+    right product, but only 1mg's search was forgiving enough to return it, so
+    the other six report not-stocked. Correcting the query and re-asking widens
+    that: "crocine" reaches 2 results, "crocin" reaches 15.
+
+    The correction is taken from titles the platforms actually returned, never
+    invented, and only at edit distance 1 -- the same bar typo_ok already uses
+    to call something a typo rather than a different brand. Digits are left
+    alone, so 650 never becomes 500.
+
+    This only widens the SEARCH. Whether a result is shown as an exact match or
+    a flagged near-match is still typo_ok's call against the original query,
+    because "lasix" and "lanix" are one edit apart and are different drugs.
+    """
+    words = {w for t in titles for w in normalize(t).split()}
+    out, changed = [], False
+    for tok in key_tokens(query):
+        if tok.isdigit() or tok in words:
+            out.append(tok)
+            continue
+        near = [(Levenshtein.distance(tok, w), w) for w in words]
+        near = [(d, w) for d, w in near if d == 1]
+        if not near:
+            return None            # nothing close: do not guess
+        # Ties are decided alphabetically only to stay deterministic; a real
+        # tie means two brands are both one edit away and neither is safe to
+        # prefer, which is why the result still faces typo_ok.
+        out.append(min(near)[1])
+        changed = True
+    return " ".join(out) if changed else None
+
+
 def demo():
     """Self-check for the identity gate. Run: python -m matching
 
@@ -160,6 +195,21 @@ def demo():
         assert identity_ok(q, t), f"rejected a real match: {q!r} vs {t!r}"
     for q, t in bad:
         assert not identity_ok(q, t), f"ACCEPTED A WRONG PRODUCT: {q!r} vs {t!r}"
+
+    # respell(): fix from the platform's own titles, never invent.
+    tt = ["Paracetamol 500mg Tablet", "Crocin 650 Tablets"]
+    assert respell("paracitamol", tt) == "paracetamol"
+    assert respell("crocine", tt) == "crocin"
+    assert respell("paracetamol", tt) is None, "rewrote an already-correct query"
+    assert respell("zzzzzzz", tt) is None, "guessed at an unrelated query"
+    # Digits are never respelt: 650 and 500 are one edit apart.
+    assert respell("dolo 650", ["Dolo 500 Tablet"]) is None
+
+    # A look-alike drug one edit away may widen the SEARCH, but must never be
+    # presented as the confident match: lasix/lanix are different drugs.
+    assert respell("lasix", ["Lanix Syrup"]) == "lanix"
+    assert not identity_ok("lasix", "Lanix Syrup"), "look-alike shown as exact"
+    assert identity_ok("lasix", "Lasix 40mg Tablet"), "real match demoted"
 
     # The glued path must never accept a run that overshoots a word boundary.
     assert not identity_ok("lidoplas", "Lido-Plast Patch"), "overshot a boundary"

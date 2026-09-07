@@ -26,7 +26,7 @@ from adapters.base import (ETA_UNKNOWN, QUICK, SLOW, Location, ProductResult,
 from adapters.onemg import resolve_latlng
 from config import (CACHE_TTL, DB_PATH, DELIVERY_COST, MEANINGFUL_SAVING,
                     PRESETS, SEARCH_BUDGET)
-from matching import identity_ok, normalize, typo_ok
+from matching import identity_ok, normalize, respell, typo_ok
 from parsing import extract_items, search_term
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -600,6 +600,7 @@ async def do_search(message, query: str, chat_id: int, urgent: bool, ctx=None):
         t.cancel()
         done.setdefault(tasks[t].PLATFORM, None)
     done = await _probe_retry(done, query, loc, deadline)
+    done = await _respell_retry(done, query, loc, deadline)
 
     ok = [r for v in done.values() if v for r in v]
     if ok:
@@ -712,7 +713,19 @@ async def _probe_retry(done: dict, query: str, loc: Location, deadline: float):
     if not name:
         return done
     log.info("probe resolved %r -> %r", query, name)
-    retry = {asyncio.create_task(m.search(name, loc)): m for m in ADAPTERS}
+    return await _refan(done, query, name, loc, deadline)
+
+
+async def _refan(done: dict, query: str, better: str, loc: Location,
+                 deadline: float):
+    """Re-ask every platform with a corrected query, keeping what improves.
+
+    Results are gated against the ORIGINAL query, never the corrected one:
+    top_matches inside the adapter judged against `better`, and the user asked
+    for `query`. A platform that already had results keeps them unless the
+    retry does strictly better, so a correction can only add.
+    """
+    retry = {asyncio.create_task(m.search(better, loc)): m for m in ADAPTERS}
     left = max(0.0, deadline - time.time())
     finished, pending = await asyncio.wait(retry, timeout=left)
     for t in pending:
@@ -720,15 +733,32 @@ async def _probe_retry(done: dict, query: str, loc: Location, deadline: float):
     for t in finished:
         mod = retry[t]
         try:
-            # Re-gate on the ORIGINAL query: the user asked for "lidoplast",
-            # and top_matches inside the adapter judged against the probed
-            # name instead.
-            got = [r for r in t.result() if identity_ok(query, r.name)]
+            got = [r for r in t.result()
+                   if identity_ok(query, r.name) or typo_ok(query, r.name)]
         except Exception:
             continue
-        if got:
+        if got and len(got) > len(done.get(mod.PLATFORM) or []):
             done[mod.PLATFORM] = got
     return done
+
+
+async def _respell_retry(done: dict, query: str, loc: Location,
+                         deadline: float):
+    """Second chance when the platforms returned the product under a DIFFERENT
+    spelling -- "paracitamol" answered by "Paracetamol 500mg Tablet".
+
+    Unlike the probe this fires on a PARTIAL result: one tolerant platform
+    found it and six did not, so there is a title to learn the real spelling
+    from. Correcting and re-asking took "crocine" from 2 results to 15.
+    """
+    titles = [r.name for v in done.values() if v for r in v]
+    if not titles or deadline - time.time() < 2:
+        return done
+    better = respell(query, titles)
+    if not better:
+        return done
+    log.info("respelt %r -> %r", query, better)
+    return await _refan(done, query, better, loc, deadline)
 
 
 async def _search_one(term: str, loc: Location) -> dict:
@@ -756,7 +786,8 @@ async def _search_one(term: str, loc: Location) -> dict:
     for t in pending:
         t.cancel()
         done.setdefault(tasks[t].PLATFORM, None)
-    return await _probe_retry(done, term, loc, deadline)
+    done = await _probe_retry(done, term, loc, deadline)
+    return await _respell_retry(done, term, loc, deadline)
 
 
 def _offers(item: str, done: dict) -> dict:
