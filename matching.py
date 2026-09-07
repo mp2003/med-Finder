@@ -52,6 +52,39 @@ def key_tokens(query: str) -> list[str]:
     return keep or toks  # never return empty: an all-generic query keeps its words
 
 
+def _word_aligned(tok: str, title_words: list[str]) -> bool:
+    """True when tok lines up with word boundaries in the title.
+
+    normalize() turns "Lido-Plast" into "lido plast", so a user typing
+    "lidoplast" fails a plain substring test -- the space sits inside the
+    token. This glues adjacent words back together to recover the match.
+
+    Two ways to align:
+      1. tok is a prefix of ONE word     "paracetamol" in "paracetamol 500"
+      2. tok spans whole words exactly   "lidoplast" == "lido" + "plast"
+
+    (1) is the long-standing rule and is kept as-is; (2) is what this function
+    adds. Note (1) also accepts "dolo" -> "Dologel", a different product -- it
+    does so in the shipped gate today, and narrowing it would break brand
+    prefixes generally. Ranking, not the gate, is what puts the exact "Dolo
+    650" above it.
+
+    What is NOT accepted is a multi-word run that overshoots a boundary, so
+    the glued path cannot invent matches the prefix rule would have refused.
+    """
+    if any(w.startswith(tok) for w in title_words):
+        return True
+    for i in range(len(title_words)):
+        run = ""
+        for w in title_words[i:]:
+            run += w
+            if run == tok:
+                return True
+            if len(run) >= len(tok):
+                break
+    return False
+
+
 def identity_ok(query: str, title: str) -> bool:
     """True only if EVERY identifying token appears in the title.
 
@@ -66,7 +99,7 @@ def identity_ok(query: str, title: str) -> bool:
         if tok.isdigit():
             if tok not in words:
                 return False
-        elif tok not in t:
+        elif not _word_aligned(tok, t.split()):
             return False
     return True
 
@@ -95,3 +128,48 @@ def typo_ok(query: str, title: str) -> bool:
         elif not any(Levenshtein.distance(tok, w) <= 1 for w in words):
             return False
     return True
+
+
+def demo():
+    """Self-check for the identity gate. Run: python -m matching
+
+    The glued fallback is the risky part -- it deliberately relaxes a safety
+    check -- so every near-miss brand that must still be REJECTED is asserted
+    here alongside the ones that must now pass.
+    """
+    ok = [("lidoplast", "Lido-Plast Lidocaine 350mg Patch"),
+          ("betadinegargle", "Betadine Gargle Mint"),
+          ("ecosprinav", "Ecosprin-AV 75 Capsule"),
+          ("ecosprin", "Ecosprin 75 Tablet"),
+          ("liv52", "Himalaya Liv. 52 DS Tablet"),
+          ("dolo", "Dolo 650 Tablet"),
+          ("dolo650", "Dolo 650 Tablet"),
+          ("crocin", "Crocin Advance 500"),
+          ("volini", "Volini Gel"),
+          ("shelcal", "Shelcal 500 Tablet"),
+          ("zincovit", "Zincovit SF Liquid"),
+          ("pan40", "PAN 40 Tablet")]
+    # Wrong products that must stay rejected. Brand-prefix hits such as
+    # "dolo" -> "Dologel" are NOT here: the shipped gate has always accepted
+    # those via the prefix rule, and ranking is what demotes them.
+    bad = [("dolo650", "Dolo 500 Tablet"),
+           ("lidoplast", "Lidocaine Gel"),
+           ("lidoplast", "Ketolin Alsi Lep Anti-Plast (100 g)"),
+           ("cristello", "O3+ Brightening Face Wash")]
+    for q, t in ok:
+        assert identity_ok(q, t), f"rejected a real match: {q!r} vs {t!r}"
+    for q, t in bad:
+        assert not identity_ok(q, t), f"ACCEPTED A WRONG PRODUCT: {q!r} vs {t!r}"
+
+    # The glued path must never accept a run that overshoots a word boundary.
+    assert not identity_ok("lidoplas", "Lido-Plast Patch"), "overshot a boundary"
+    # A digit token must still match whole, or 650 starts matching 6500.
+    assert not identity_ok("dolo 650", "Dolo 6500 Tablet")
+    # typo_ok stays independent of the glued path.
+    assert typo_ok("biodems f", "BIODENS-F Tablet")
+    print(f"  ok  {len(ok)} matches accepted, {len(bad)} wrong products rejected")
+    print("matching OK")
+
+
+if __name__ == "__main__":
+    demo()

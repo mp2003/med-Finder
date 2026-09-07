@@ -22,11 +22,11 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 import db
 from adapters import ADAPTERS, COMING_SOON
 from adapters.base import (ETA_UNKNOWN, QUICK, SLOW, Location, ProductResult,
-                           eta_minutes, search_wide)
+                           eta_minutes, probe_name, search_wide)
 from adapters.onemg import resolve_latlng
 from config import (CACHE_TTL, DB_PATH, DELIVERY_COST, MEANINGFUL_SAVING,
                     PRESETS, SEARCH_BUDGET)
-from matching import normalize, typo_ok
+from matching import identity_ok, normalize, typo_ok
 from parsing import extract_items, search_term
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -599,6 +599,7 @@ async def do_search(message, query: str, chat_id: int, urgent: bool, ctx=None):
     for t in pending:  # over budget -> render as failed
         t.cancel()
         done.setdefault(tasks[t].PLATFORM, None)
+    done = await _probe_retry(done, query, loc, deadline)
 
     ok = [r for v in done.values() if v for r in v]
     if ok:
@@ -687,6 +688,49 @@ async def on_list_urgency(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _report(q.message, ctx, items, results, urgent)
 
 
+async def _probe_retry(done: dict, query: str, loc: Location, deadline: float):
+    """Second chance when EVERY platform came back empty.
+
+    A glued brand ("lidoplast" for Lido-Plast) is a query no platform matches,
+    so there is nothing for matching.py to rescue -- the fix has to happen
+    before the fan-out. One platform is asked every split spelling at once; if
+    it names the product, that name is re-fanned to all adapters.
+
+    Costs nothing on a normal search: it only runs when the search had already
+    failed completely, and it respects the caller's remaining budget.
+    """
+    if any(done.get(m.PLATFORM) for m in ADAPTERS):
+        return done
+    if deadline - time.time() < 2:          # no room left to be useful
+        return done
+    probe = ADAPTERS[0]                     # 1mg: fastest and most tolerant
+    try:
+        name = await probe_name(probe, query, loc)
+    except Exception as e:
+        log.warning("probe failed for %r: %s", query, e)
+        return done
+    if not name:
+        return done
+    log.info("probe resolved %r -> %r", query, name)
+    retry = {asyncio.create_task(m.search(name, loc)): m for m in ADAPTERS}
+    left = max(0.0, deadline - time.time())
+    finished, pending = await asyncio.wait(retry, timeout=left)
+    for t in pending:
+        t.cancel()
+    for t in finished:
+        mod = retry[t]
+        try:
+            # Re-gate on the ORIGINAL query: the user asked for "lidoplast",
+            # and top_matches inside the adapter judged against the probed
+            # name instead.
+            got = [r for r in t.result() if identity_ok(query, r.name)]
+        except Exception:
+            continue
+        if got:
+            done[mod.PLATFORM] = got
+    return done
+
+
 async def _search_one(term: str, loc: Location) -> dict:
     """One item across every adapter. Mirrors do_search's fan-out and budget."""
     done: dict[str, list | None] = {}
@@ -712,7 +756,7 @@ async def _search_one(term: str, loc: Location) -> dict:
     for t in pending:
         t.cancel()
         done.setdefault(tasks[t].PLATFORM, None)
-    return done
+    return await _probe_retry(done, term, loc, deadline)
 
 
 def _offers(item: str, done: dict) -> dict:
