@@ -18,11 +18,26 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at TEXT
 )"""
 
+# Which supplier was chosen for an item. Telegram never reports a tap on a url=
+# button, so a pick can only be known by asking -- this is where the answer
+# lives. Order history, so rows accumulate rather than being replaced.
+_PICKS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS picks (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    INTEGER NOT NULL,
+    item       TEXT NOT NULL,
+    platform   TEXT NOT NULL,
+    price      REAL,
+    url        TEXT,
+    created_at TEXT NOT NULL
+)"""
+
 
 async def init():
     """Create the users table if absent, and add columns older DBs lack."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(_SCHEMA)
+        await db.execute(_PICKS_SCHEMA)
         # bot.db predates im_store; CREATE TABLE IF NOT EXISTS will not add it.
         try:
             await db.execute("ALTER TABLE users ADD COLUMN im_store TEXT")
@@ -57,3 +72,27 @@ async def get_location(chat_id: int) -> Location | None:
         ) as cur:
             row = await cur.fetchone()
     return Location(*row) if row else None
+
+
+async def save_pick(chat_id: int, item: str, platform: str,
+                    price: float | None, url: str | None):
+    """Record which supplier was chosen for one item."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO picks (chat_id, item, platform, price, url, created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (chat_id, item, platform, price, url,
+             datetime.datetime.now().isoformat(timespec="seconds")))
+        await db.commit()
+
+
+async def recent_pick(chat_id: int, item: str) -> str | None:
+    """Platform last chosen for this item, or None. Matched case-insensitively
+    so 'Dolo 650' and 'dolo 650' are the same item."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT platform FROM picks WHERE chat_id=? AND lower(item)=lower(?)"
+            " ORDER BY id DESC LIMIT 1", (chat_id, item)
+        ) as cur:
+            row = await cur.fetchone()
+    return row[0] if row else None
