@@ -60,9 +60,18 @@ bot.py::ask_urgency                 1 item -> search; 2+ -> order-list flow
 
 **Order lists.** `parsing.extract_items` turns a human message ("sir can u please
 order dolo, eno and colgate") into items. Two or more takes the list flow:
-confirm → one ranking question → search each item → `complete_baskets` finds
-platforms carrying *everything*, because one order beats three. No complete
-basket means an item-by-item walk with a recorded pick each.
+confirm → one ranking question → search each item → `plans()` groups the order
+into the **fewest platforms**, because each extra platform is another delivery
+fee. `[Item by item]` still offers the per-item walk with a recorded pick each.
+
+`plans()` enumerates all 2^7 platform subsets (~33us) rather than using greedy
+set-cover, so the grouping is the exact optimum -- greedy takes the platform
+covering the most items and can force a third order where two sufficed. The
+objective is `item prices + DELIVERY_COST per order`, which is why no separate
+"consolidation tolerance" knob exists: `DELIVERY_COST` already decides, in
+rupees, whether paying more on one line to collapse an order is worth it.
+`best_plan()` then prefers fewer orders unless splitting saves at least
+`MEANINGFUL_SAVING`.
 
 **The adapter contract** is the core abstraction. Each `adapters/<platform>.py`
 exposes `PLATFORM: str` and `async def search(query, loc) -> list[ProductResult]`,

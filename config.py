@@ -43,4 +43,13 @@ CACHE_TTL = 15 * 60      # seconds
 ADAPTER_TIMEOUT = 8.0    # per-platform HTTP timeout
 SEARCH_BUDGET = 10.0     # overall fan-out cap; render whatever arrived
 MIN_MATCH_SCORE = 55     # rapidfuzz cutoff
+# Rs per order, used to group an order list into the fewest platforms. Paying
+# +Rs 25 on one line to collapse an order is correct at 40 and wrong at 5, so
+# this number IS the consolidation policy. No platform publishes a fee we can
+# scrape, hence one global constant rather than a per-platform field.
+DELIVERY_COST = 40
+# An extra order must save at least this much to be worth placing. Without it
+# the maths splits an order to save Rs 10, which is not worth a second delivery
+# to receive and track.
+MEANINGFUL_SAVING = 50
 MAX_RESULTS = 3          # per platform

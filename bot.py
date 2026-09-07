@@ -4,6 +4,7 @@ Run: python bot.py   (long polling, no webhook/SSL needed)
 """
 import asyncio
 import html
+import itertools
 import logging
 import os
 import re
@@ -20,9 +21,11 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 
 import db
 from adapters import ADAPTERS, COMING_SOON
-from adapters.base import Location, ProductResult, eta_minutes
+from adapters.base import (ETA_UNKNOWN, QUICK, SLOW, Location, ProductResult,
+                           eta_minutes)
 from adapters.onemg import resolve_latlng
-from config import CACHE_TTL, PRESETS, SEARCH_BUDGET
+from config import (CACHE_TTL, DB_PATH, DELIVERY_COST, MEANINGFUL_SAVING,
+                    PRESETS, SEARCH_BUDGET)
 from matching import normalize, typo_ok
 from parsing import extract_items, search_term
 
@@ -313,7 +316,7 @@ def results_keyboard(query: str, done: dict, urgent: bool) -> InlineKeyboardMark
 def _sort_key(r: ProductResult, urgent: bool):
     """Soonest-first or cheapest-first, with the other field as tie-break."""
     price = r.price if r.price is not None else float("inf")
-    eta = eta_minutes(r.eta)
+    eta = eta_minutes(r.eta, r.platform)
     return (eta, price) if urgent else (price, eta)
 
 
@@ -722,79 +725,243 @@ def _offers(item: str, done: dict) -> dict:
     return out
 
 
-def complete_baskets(items: list[str], results: dict, urgent: bool):
-    """Platforms carrying EVERY item, best first on the chosen axis.
+def _plan_cost(picked: dict) -> tuple[int, float]:
+    """(unpriced lines, rupees). A missing price is NOT free: the old
+    `sum(r.price or 0)` scored it as 0, so an item with no published price
+    made a whole basket look cheapest and win. _sort_key calls the same None
+    float("inf"); ranking on the count first keeps the two consistent without
+    letting an infinity swallow every comparison."""
+    rs = sum(r.price for _, r in picked.values() if r.price is not None)
+    return sum(r.price is None for _, r in picked.values()), rs
 
-    Returns [(platform, {item: result}, total)]. One order beats three, so a
-    platform that has the lot wins even when another is cheaper on one line.
+
+def _plan_eta(picked: dict) -> int:
+    """Slowest KNOWN eta. eta_minutes returns ETA_UNKNOWN for anything it
+    cannot parse, and three live adapters never send one, so a plain max()
+    sinks an otherwise-fine plan on a single unpublished eta."""
+    known = [e for e in (eta_minutes(r.eta, r.platform)
+                         for _, r in picked.values())
+             if e < ETA_UNKNOWN]
+    return max(known) if known else ETA_UNKNOWN
+
+
+def _mixed_speed(platforms) -> bool:
+    """True when one leg is 30-minute and another is days away."""
+    used = set(platforms)
+    return bool(QUICK & used) and bool(SLOW & used)
+
+
+def plans(items: list[str], results: dict, urgent: bool):
+    """Every way to buy the stocked items, best first.
+
+    Returns [(platforms, {item: (platform, result)}, n_unpriced, rupees)].
+    Items stocked nowhere are dropped rather than making the order impossible.
+
+    Exhaustive over every platform subset -- 2**7 = 128 of them, ~33us -- so
+    this is the exact optimum. Greedy set-cover is a ln(n) approximation and
+    is wrong on cases this small: it takes the platform covering the most
+    items, which can force a third order where two sufficed.
+    ponytail: 2**len(ADAPTERS). Fine to ~14 platforms, then go greedy.
     """
     per_item = {it: _offers(it, results.get(it, {})) for it in items}
-    full = []
-    for platform in {p for offs in per_item.values() for p in offs}:
-        if all(platform in per_item[it] for it in items):
-            picked = {it: per_item[it][platform] for it in items}
-            total = sum(r.price or 0 for r in picked.values())
-            full.append((platform, picked, total))
+    per_item = {it: o for it, o in per_item.items() if o}
+    universe = sorted({p for o in per_item.values() for p in o})
+    out = []
+    for k in range(1, len(universe) + 1):
+        for combo in itertools.combinations(universe, k):
+            picked = {}
+            for it, offers in per_item.items():
+                cand = [(p, offers[p]) for p in combo if p in offers]
+                if not cand:
+                    break                      # this subset misses an item
+                picked[it] = min(cand, key=lambda pr: _sort_key(pr[1], urgent))
+            else:
+                used = sorted({p for p, _ in picked.values()})
+                # Drop subsets where a platform won nothing: that plan buys
+                # exactly what a smaller one does but gets charged another
+                # DELIVERY_COST, and without this the "other plans" list fills
+                # with near-duplicates.
+                if len(used) == k:
+                    n_none, rs = _plan_cost(picked)
+                    out.append((used, picked, n_none, rs))
     if urgent:
-        full.sort(key=lambda b: (max(eta_minutes(r.eta) for r in b[1].values()),
-                                 b[2]))
+        out.sort(key=lambda pl: (_plan_eta(pl[1]), pl[2], _allin(pl),
+                                 len(pl[0]), pl[0]))
     else:
-        full.sort(key=lambda b: (b[2],
-                                 max(eta_minutes(r.eta) for r in b[1].values())))
-    return full
+        out.sort(key=lambda pl: (pl[2], _allin(pl), len(pl[0]), pl[0]))
+    return out
+
+
+def _allin(plan) -> float:
+    """Item prices plus one delivery per order -- the number the user pays."""
+    return plan[3] + DELIVERY_COST * len(plan[0])
+
+
+def best_plan(all_plans: list, urgent: bool = False):
+    """Fewest orders, unless splitting saves real money.
+
+    Pure cost would split a Rs 540 single order to save Rs 10, which is not
+    worth a second delivery to receive and track. So: among plans within
+    MEANINGFUL_SAVING of the cheapest, take the one with the fewest orders.
+
+    When the user asked for soonest delivery, plans() has already sorted on
+    eta and its answer stands -- applying the cost rule here too would hand
+    back a 3-hour order when they said they were in a hurry.
+    """
+    if not all_plans:
+        return None
+    if urgent:
+        return all_plans[0]
+    # Compare on cost only among plans that price everything: an unpriced line
+    # contributes 0 rupees, so a plan carrying one looks cheaper than it is and
+    # would win a comparison it never earned. plans() already sorts those last.
+    fewest_unknown = min(pl[2] for pl in all_plans)
+    pool = [pl for pl in all_plans if pl[2] == fewest_unknown]
+    cheapest = min(_allin(pl) for pl in pool)
+    near = [pl for pl in pool if _allin(pl) <= cheapest + MEANINGFUL_SAVING]
+    return min(near, key=lambda pl: (len(pl[0]), _allin(pl), pl[0]))
+
+
+def _plan_lines(plan, items, urgent) -> list[str]:
+    """One plan, rendered. Shared by the first report and every re-render from
+    'Show other plans' -- two renderers would drift apart."""
+    used, picked, n_none, rupees = plan
+    order = "soonest delivery" if urgent else "lowest price"
+    found = len(picked)
+    scope = f"{found} of {len(items)} items, " if found != len(items) else ""
+    lines = [f"<b>BEST PLAN — {len(used)} "
+             f"{'order' if len(used) == 1 else 'orders'}</b>"
+             f"   ({scope}by {order})", ""]
+
+    for platform in used:
+        mine = [(it, r) for it, (p, r) in picked.items() if p == platform]
+        # Apollo prices delivery PER PRODUCT ("29 mins" on one line, "3 hr" on
+        # the next), so the first line's eta is not the order's. Show the
+        # slowest -- that is when the order actually lands.
+        etas = [(eta_minutes(r.eta, r.platform), _eta_text(r.eta))
+                for _, r in mine if r.eta]
+        etas = [e for e in etas if e[1]]        # catalogue tags say nothing
+        # Blinkit/Instamart publish tags or nothing at all, but we know the
+        # delivery model, so name it rather than leaving the order undated.
+        eta = max(etas)[1] if etas else (
+            "under 30 min" if platform in QUICK else "")
+        lines.append(f"<b><u>{html.escape(platform)}</u></b>   {len(mine)} "
+                     f"{'item' if len(mine) == 1 else 'items'}"
+                     + (f"   {html.escape(eta)}" if eta else ""))
+        for it, r in mine:
+            price = f"Rs {r.price:g}" if r.price is not None else "price n/a"
+            lines.append(f"{html.escape(it)} — <b>{price}</b>")
+            lines.append(html.escape(r.url))
+        lines.append("")
+
+    if _mixed_speed(used):
+        fast = _join([html.escape(p) for p in used if p in QUICK])
+        slow = _join([html.escape(p) for p in used if p in SLOW])
+        lines.append(f"<b>Note</b>   These arrive at different times — {fast} "
+                     f"in about 30 minutes, {slow} in a few days. Order "
+                     "separately if you need one sooner.")
+        lines.append("")
+
+    missing = [it for it in items if it not in picked]
+    if missing:
+        lines.append("Not stocked anywhere: "
+                     + _join([html.escape(m) for m in missing]) + ".")
+        lines.append("")
+
+    # DELIVERY_COST still drives the grouping -- it is just not shown, since
+    # it is our estimate rather than a fee any platform quoted.
+    lines.append(f"<b>Items   Rs {rupees:g}</b>"
+                 + (f"   ({n_none} without a published price)" if n_none else ""))
+    return lines
+
+
+def _plan_rows(ctx) -> list[list[InlineKeyboardButton]]:
+    """Buttons under a plan. 'Item by item' reuses the existing walk handler."""
+    rows = []
+    if len(ctx.user_data.get("batch_plans") or []) > 1:
+        rows.append([InlineKeyboardButton("Show other plans",
+                                          callback_data="plan:list")])
+    rows.append([InlineKeyboardButton("Item by item", callback_data="walk:y")])
+    return rows
+
+
+def _alt_rows(ctx) -> list[list[InlineKeyboardButton]]:
+    """The alternatives keyboard. Capped at 5 -- nobody reads a sixth."""
+    rows = []
+    for i, pl in enumerate((ctx.user_data.get("batch_plans") or [])[:5]):
+        # Item price only, and never the all-in figure: these are ranked by
+        # cost INCLUDING delivery, so showing item totals makes the winning
+        # plan look dearer than the ones it beats.
+        label = (f"{len(pl[0])} {'order' if len(pl[0]) == 1 else 'orders'} — "
+                 f"{', '.join(pl[0])}   items Rs {pl[3]:g}")
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"plan:{i}")])
+    return rows
 
 
 async def _report(message, ctx, items, results, urgent):
-    """One basket if a platform has everything, otherwise item by item."""
-    baskets = complete_baskets(items, results, urgent)
-    order = "soonest delivery" if urgent else "lowest price"
+    """Recommend the cheapest grouping, counting one delivery per platform."""
+    all_plans = plans(items, results, urgent)
+    ctx.user_data["batch_plans"] = all_plans
 
-    if baskets:
-        platform, picked, total = baskets[0]
-        lines = [f"All <b>{len(items)} items</b> are available at "
-                 f"<b>{len(baskets)}</b> "
-                 f"{'platform' if len(baskets) == 1 else 'platforms'}.",
-                 "",
-                 f"<b>BEST BASKET — <u>{html.escape(platform)}</u></b>"
-                 f"   (by {order})"]
-        for it in items:
-            r = picked[it]
-            price = f"Rs {r.price:g}" if r.price is not None else "price n/a"
-            lines.append(f"{html.escape(it)} — <b>{price}</b>")
-        lines.append(f"<b>Total   Rs {total:.2f}</b>")
-
-        etas = {_eta_text(r.eta) for r in picked.values() if r.eta}
-        if etas:
-            lines.append(f"Delivery   <b>{html.escape(max(etas, key=len))}</b>")
-        if len(baskets) > 1:
-            others = ", ".join(f"{p} Rs {t:.2f}" for p, _, t in baskets[1:4])
-            lines.append("")
-            lines.append(f"Other complete baskets: {html.escape(others)}")
-        lines.append("")
-        lines.append("Open each item:")
-        for it in items:
-            lines.append(html.escape(picked[it].url))
-
-        # One order, so record the whole basket against this platform.
-        for it in items:
-            r = picked[it]
-            await db.save_pick(message.chat_id, it, platform, r.price, r.url)
+    if not all_plans:
         ctx.user_data.pop("batch", None)
-        return await message.reply_text("\n".join(lines), parse_mode="HTML",
-                                        disable_web_page_preview=True)
+        return await message.reply_text(
+            f"None of those {len(items)} items are stocked at any platform "
+            "we can reach. Check the spelling, or send them one at a time.")
 
-    # No single platform has the lot -- walk the items one at a time.
-    missing = [it for it in items if not _offers(it, results.get(it, {}))]
-    intro = [f"No single platform has all {len(items)} items."]
-    if missing:
-        intro.append("Not found anywhere: "
-                     + _join([html.escape(m) for m in missing]) + ".")
-    intro.append("Going through them one at a time.")
-    await message.reply_text("\n\n".join(intro), parse_mode="HTML")
+    top = best_plan(all_plans, urgent)
+    ctx.user_data["batch_plan_i"] = all_plans.index(top)
+    for it, (platform, r) in top[1].items():
+        await db.save_pick(message.chat_id, it, platform, r.price, r.url)
+    await message.reply_text(
+        "\n".join(_plan_lines(top, items, urgent)), parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(_plan_rows(ctx)))
+
+
+async def on_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """'Show other plans', and switching between them. Re-renders in place --
+    a new message per tap would bury the plan the user is comparing against."""
+    q = update.callback_query
+    await q.answer()
+    all_plans = ctx.user_data.get("batch_plans")
+    if not all_plans:
+        return await q.edit_message_text("That list has expired. "
+                                         "Send the message again.")
+    if q.data == "plan:list":
+        return await q.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup(_alt_rows(ctx)))
+
+    i = int(q.data.split(":")[1])
+    if i >= len(all_plans):
+        return await q.edit_message_text("That plan is no longer available.")
+    ctx.user_data["batch_plan_i"] = i
+    items = ctx.user_data.get("batch") or []
+    urgent = ctx.user_data.get("batch_urgent", False)
+    await q.edit_message_text(
+        "\n".join(_plan_lines(all_plans[i], items, urgent)),
+        parse_mode="HTML", disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(_plan_rows(ctx)))
+
+
+async def on_walk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Answer to 'want to see every supplier?' -- start the walk or stop."""
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_reply_markup(reply_markup=None)   # spend the buttons
+    if q.data == "walk:n" or not ctx.user_data.get("batch"):
+        for k in ("batch", "batch_i", "batch_picks", "batch_results",
+                  "batch_offers", "batch_urgent", "batch_plans",
+                  "batch_plan_i"):
+            ctx.user_data.pop(k, None)
+        return await q.message.reply_text(
+            "Links above are the best option for each item. "
+            "Send another list any time.")
 
     ctx.user_data["batch_i"] = 0
     ctx.user_data["batch_picks"] = {}
-    await _next_item(message, ctx)
+    await q.message.reply_text("Going through them one at a time.")
+    await _next_item(q.message, ctx)
 
 
 async def _next_item(message, ctx):
@@ -880,7 +1047,7 @@ async def _summary(message, ctx):
         lines.append("<i>Across different platforms — these cannot be "
                      "ordered together.</i>")
     for k in ("batch", "batch_i", "batch_picks", "batch_results",
-              "batch_offers", "batch_urgent"):
+              "batch_offers", "batch_urgent", "batch_plans", "batch_plan_i"):
         ctx.user_data.pop(k, None)
     await message.reply_text("\n".join(lines), parse_mode="HTML",
                              disable_web_page_preview=True)
@@ -931,6 +1098,8 @@ def main():
     app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^list:"))
     app.add_handler(CallbackQueryHandler(on_list_urgency, pattern=r"^lurg:"))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
+    app.add_handler(CallbackQueryHandler(on_walk, pattern=r"^walk:"))
+    app.add_handler(CallbackQueryHandler(on_plan, pattern=r"^plan:"))
     app.add_handler(MessageHandler(filters.LOCATION, on_live_location))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ask_urgency))
@@ -939,5 +1108,108 @@ def main():
     app.run_polling()
 
 
+def demo():
+    """Self-check for the order grouper. Run: python bot.py --demo
+
+    The grouper decides real money, so it gets the one runnable check: case 6
+    brute-forces every item->platform assignment and asserts we found the true
+    optimum, which is the only way to catch a bad sort key.
+    """
+    def R(platform, price, eta="30 mins"):
+        return ProductResult(platform, "x", price, None, True, eta,
+                             f"http://{platform}/x", 100.0)
+
+    def mk(spec):
+        """{item: {platform: price}} -> the results shape plans() expects."""
+        return {it: {p: [R(p, pr)] for p, pr in offers.items()}
+                for it, offers in spec.items()}
+
+    # 1. Two orders beat four. Per-item-cheapest picks C,D,E,F = Rs 132 of
+    #    items but FOUR deliveries (Rs 292 all-in); A+B pays Rs 8 more on
+    #    items and lands at Rs 220.
+    items = ["i1", "i2", "i3", "i4"]
+    res = mk({"i1": {"A": 30, "C": 28}, "i2": {"A": 20, "D": 18},
+              "i3": {"B": 50, "E": 48}, "i4": {"B": 40, "F": 38}})
+    got = plans(items, res, urgent=False)
+    assert [tuple(pl[0]) for pl in got] == sorted(
+        {tuple(pl[0]) for pl in got}, key=[tuple(pl[0]) for pl in got].index), \
+        "duplicate platform-sets in the plan list"
+    top = best_plan(got)
+    assert top[0] == ["A", "B"], top[0]
+    assert _allin(top) == 220, _allin(top)
+
+    # 2. Fewer orders wins a trivial saving; real money wins the extra order.
+    close = plans(["i1", "i2"],
+                  mk({"i1": {"Z": 250, "A": 250}, "i2": {"Z": 250, "B": 200}}),
+                  urgent=False)
+    assert len(best_plan(close)[0]) == 1, "split an order to save Rs 10"
+    worth = plans(["i1", "i2"],
+                  mk({"i1": {"Z": 250, "A": 250}, "i2": {"Z": 330, "B": 200}}),
+                  urgent=False)
+    assert len(best_plan(worth)[0]) == 2, "paid Rs 90 to avoid a 2nd order"
+
+    # 3. price=None is not free -- the `r.price or 0` bug.
+    p3 = best_plan(plans(["i1", "i2"],
+                         mk({"i1": {"A": None, "B": 10}, "i2": {"A": 5, "B": 5}}),
+                         urgent=False))
+    assert p3[2] == 0, "picked an unpriced offer over a priced one"
+
+    # 4. An item stocked nowhere is excluded, not fatal.
+    p4 = best_plan(plans(["i1", "i2"], mk({"i1": {"A": 10}, "i2": {}}),
+                         urgent=False))
+    assert p4[0] == ["A"] and list(p4[1]) == ["i1"], p4
+
+    # 5. One unpublished eta must not sink a plan in urgent mode.
+    res5 = mk({"i1": {"A": 10}, "i2": {"A": 10, "B": 500}})
+    res5["i2"]["A"] = [R("A", 10, eta=None)]
+    res5["i2"]["B"] = [R("B", 500, eta="10 mins")]
+    assert best_plan(plans(["i1", "i2"], res5, urgent=True))[0] == ["A"]
+
+    # 5b. Urgent means urgent: a cheaper-but-slower plan must not win when the
+    #     user asked for soonest delivery. Real case -- Blinkit 20min/Rs 126
+    #     against Apollo 3hr/Rs 87.
+    fast_v_cheap = mk({"i1": {"Blinkit": 31, "Apollo": 32},
+                       "i2": {"Blinkit": 50, "Apollo": 10}})
+    fast_v_cheap["i1"]["Blinkit"] = [R("Blinkit", 31, eta="unicorn")]
+    fast_v_cheap["i2"]["Blinkit"] = [R("Blinkit", 50, eta="express")]
+    fast_v_cheap["i1"]["Apollo"] = [R("Apollo", 32, eta="3 hr")]
+    fast_v_cheap["i2"]["Apollo"] = [R("Apollo", 10, eta="3 hr")]
+    both = plans(["i1", "i2"], fast_v_cheap, urgent=True)
+    assert best_plan(both, urgent=True)[0] == ["Blinkit"], "urgent picked slow"
+    cheap = plans(["i1", "i2"], fast_v_cheap, urgent=False)
+    assert best_plan(cheap, urgent=False)[0] == ["Apollo"], "cheapest picked dear"
+
+    # 5c. A quick-commerce catalogue tag is not an unknown eta. Blinkit labels
+    #     some lines "pharma_rx"; scoring that ETA_UNKNOWN sank a 15-minute
+    #     order behind a next-day courier.
+    assert eta_minutes("pharma_rx", "Blinkit") < ETA_UNKNOWN
+    assert eta_minutes(None, "Instamart") < ETA_UNKNOWN
+    assert eta_minutes(None, "Netmeds") == ETA_UNKNOWN
+
+    # 6. Speed mixing is a platform fact, not an eta fact. An eta-derived
+    #    predicate gets Blinkit+Instamart wrong -- Instamart publishes none.
+    assert _mixed_speed(["Blinkit", "Netmeds"])
+    assert not _mixed_speed(["Blinkit", "Instamart"])
+    assert not _mixed_speed(["1mg", "Apollo"])
+
+    # 7. Exhaustive == optimal, against an independent brute force.
+    import random
+    random.seed(11)
+    for n in range(200):
+        its = [f"i{i}" for i in range(random.randint(2, 5))]
+        spec = {it: {p: random.randint(5, 300)
+                     for p in random.sample("ABCDEFG", random.randint(1, 4))}
+                for it in its}
+        got = plans(its, mk(spec), urgent=False)
+        assert got
+        mine = min(_allin(pl) for pl in got)
+        brute = min(sum(pr for _, pr in c) + DELIVERY_COST * len({p for p, _ in c})
+                    for c in itertools.product(
+                        *[[(p, pr) for p, pr in spec[it].items()] for it in its]))
+        assert abs(mine - brute) < 1e-9, f"case {n}: got {mine}, optimal {brute}"
+    print("  ok  200 random cases match brute-force optimum")
+    print("grouper OK")
+
+
 if __name__ == "__main__":
-    main()
+    demo() if "--demo" in sys.argv else main()

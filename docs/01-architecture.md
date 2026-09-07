@@ -56,10 +56,11 @@ on_list_urgency                ->  one ranking question for the whole list
   ▼
 _search_one per item, SEQUENTIALLY (platforms in parallel within each item)
   ▼
-complete_baskets               ->  platforms carrying EVERY item
-  │
-  ├── basket exists  -> recommend the winner on the chosen axis, links, total
-  └── none           -> walk item by item, record a pick each, then summarise
+plans()                        ->  every grouping, fewest platforms first
+  │                                  (exhaustive over 2^7 subsets; exact)
+  ├── best_plan() -> one message: per-platform sections, links, delivery, total
+  ├── [Show other plans] -> re-render an alternative in place
+  └── [Item by item]     -> walk item by item, record a pick each, summarise
 ```
 
 One order beats three, so a platform holding the whole list wins even when
