@@ -86,9 +86,30 @@ def to_float(v) -> float | None:
 # Sorts last: an unknown ETA must never outrank a known one.
 ETA_UNKNOWN = 10 ** 6
 
+# Delivery speed per platform, because it CANNOT be read off the eta field.
+# Only 1mg, Apollo, Blinkit and PharmEasy publish an eta at all; Instamart,
+# DMart and Netmeds always send None. Instamart is 30-minute quick-commerce
+# yet eta_minutes() scores it ETA_UNKNOWN -- the slowest value there is -- so
+# anything derived from eta alone calls Blinkit+Instamart a mixed-speed order,
+# which is exactly backwards. Keyed on PLATFORM.
+#
+# 1mg, Apollo and PharmEasy are deliberately in neither set: they publish a
+# real eta, so they are classified from data instead of guessed here.
+# ponytail: two sets beat an enum for 7 platforms. Widen only if a third class
+# (same-day slots) ever needs its own copy.
+QUICK = {"Blinkit", "Instamart"}      # ~30 min
+QUICK_MINUTES = 20   # what a QUICK platform is worth when it publishes no eta
+SLOW = {"Netmeds", "DMart"}           # days, or slot-based with no eta
 
-def eta_minutes(eta: str | None) -> int:
+
+def eta_minutes(eta: str | None, platform: str | None = None) -> int:
     """Best-effort delivery time in minutes, for ranking only.
+
+    Pass `platform` wherever it is known. Blinkit tags some catalogue lines
+    `pharma_rx`/`longtail` -- classifications, not speeds -- and Instamart
+    sends no eta at all, so string-only parsing scores a 15-minute order
+    ETA_UNKNOWN and sinks it behind a next-day courier. QUICK is the floor for
+    those platforms, not a guess about the individual line.
 
     Every platform words this differently -- '45 mins', 'Get by 7pm, Tomorrow',
     'Delivery by Tue, 2 Sep'. We only need a comparable number, so a same-day
@@ -97,7 +118,7 @@ def eta_minutes(eta: str | None) -> int:
     keeps unknown ETAs at the bottom instead of silently winning.
     """
     if not eta:
-        return ETA_UNKNOWN
+        return QUICK_MINUTES if platform in QUICK else ETA_UNKNOWN
     s = eta.lower()
     m = re.search(r"(\d+)\s*(min|hour|hr|day)", s)
     if m:
@@ -116,7 +137,7 @@ def eta_minutes(eta: str | None) -> int:
         return 1440
     if "today" in s or "tonight" in s:
         return 240
-    return ETA_UNKNOWN
+    return QUICK_MINUTES if platform in QUICK else ETA_UNKNOWN
 
 
 def top_matches(query: str, results: list[ProductResult]) -> list[ProductResult]:
