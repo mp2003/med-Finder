@@ -160,3 +160,74 @@ def top_matches(query: str, results: list[ProductResult]) -> list[ProductResult]
     similar = [r for r in results if r.match_score >= MIN_MATCH_SCORE]
     similar.sort(key=lambda r: (r.available, r.match_score), reverse=True)
     return similar[:MAX_RESULTS]
+
+
+# Brand names split and join freely: users type "Eco Sprin", the catalogue
+# lists "Ecosprin", and vice versa. Only 1mg and DMart tolerate the mismatch;
+# Apollo, PharmEasy, Netmeds and Blinkit all return ZERO results for the
+# spelling they do not hold, which reads as "not stocked" and pushes the order
+# onto an extra platform.
+#
+# Neither spelling wins everywhere -- "Dolo 650" beats "dolo650" on 1mg (3
+# results vs 1) while "ecosprin" beats "Eco Sprin" on Blinkit (3 vs 0) -- so
+# this cannot be a one-way normalisation. Try the query as typed, then the
+# variants, and stop at the first that finds anything.
+def variants(query: str) -> list[str]:
+    """Spellings to try, best first. Always starts with the query as typed."""
+    out = [query]
+
+    def add(s):
+        if s and s.lower() != query.lower() and s not in out:
+            out.append(s)
+
+    # "Eco Sprin 75" -> "EcoSprin 75": join the letter-only run that starts the
+    # name, but leave the strength alone -- "EcoSprin75" matches nothing.
+    add(re.sub(r"\b([a-zA-Z]+)\s+([a-zA-Z]+)\b", r"\1\2", query, count=1))
+    # The reverse: a digit run glued to the brand. dolo650 -> dolo 650.
+    add(re.sub(r"([a-zA-Z])(\d)", r"\1 \2", query))
+    return out
+
+
+async def search_wide(mod, query: str, loc) -> list[ProductResult]:
+    """One adapter, retried on a respelt query when the first attempt is empty.
+
+    Results are scored against the ORIGINAL query, never the variant that
+    found them: identity_ok("ecosprin", "Eco Sprin 150 Tablet") is False, so
+    re-gating on the variant would throw away the very products the retry
+    exists to find. top_matches inside the adapter already gated on the
+    variant, hence the re-run here.
+
+    Only fires when a platform returned nothing, so a hit on the first
+    spelling costs no extra request -- which is what keeps this inside
+    SEARCH_BUDGET.
+    """
+    tried = variants(query)
+    first = await mod.search(tried[0], loc)
+    if first:
+        return first
+    for alt in tried[1:]:
+        out = await mod.search(alt, loc)
+        if out:
+            return top_matches(query, out)
+    return []
+
+def demo():
+    """Self-check for the query variants. Run: python -m adapters.base"""
+    assert variants("Eco Sprin") == ["Eco Sprin", "EcoSprin"]
+    assert variants("Eco Sprin 75") == ["Eco Sprin 75", "EcoSprin 75"], \
+        "joined the strength into the brand"
+    assert variants("dolo650") == ["dolo650", "dolo 650"]
+    # No variant means no second request: the common case must stay free.
+    assert variants("ecosprin") == ["ecosprin"]
+    assert variants("Shelcal 500") == ["Shelcal 500"], "split a strength"
+    assert variants("Eno") == ["Eno"]
+
+    # A QUICK platform with no published eta must not sort as unknown.
+    assert eta_minutes(None, "Instamart") < ETA_UNKNOWN
+    assert eta_minutes(None, "Netmeds") == ETA_UNKNOWN
+    assert why(Exception()) == "Exception", "empty message lost the class name"
+    print("base OK")
+
+
+if __name__ == "__main__":
+    demo()

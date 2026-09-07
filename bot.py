@@ -22,7 +22,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 import db
 from adapters import ADAPTERS, COMING_SOON
 from adapters.base import (ETA_UNKNOWN, QUICK, SLOW, Location, ProductResult,
-                           eta_minutes)
+                           eta_minutes, search_wide)
 from adapters.onemg import resolve_latlng
 from config import (CACHE_TTL, DB_PATH, DELIVERY_COST, MEANINGFUL_SAVING,
                     PRESETS, SEARCH_BUDGET)
@@ -577,7 +577,8 @@ async def do_search(message, query: str, chat_id: int, urgent: bool, ctx=None):
         parse_mode="HTML", disable_web_page_preview=True)
 
     done: dict[str, list | None] = {}
-    tasks = {asyncio.create_task(m.search(query, loc)): m for m in ADAPTERS}
+    tasks = {asyncio.create_task(search_wide(m, query, loc)): m
+             for m in ADAPTERS}
     deadline = time.time() + SEARCH_BUDGET
     pending = set(tasks)
     while pending:
@@ -689,7 +690,8 @@ async def on_list_urgency(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _search_one(term: str, loc: Location) -> dict:
     """One item across every adapter. Mirrors do_search's fan-out and budget."""
     done: dict[str, list | None] = {}
-    tasks = {asyncio.create_task(m.search(term, loc)): m for m in ADAPTERS}
+    tasks = {asyncio.create_task(search_wide(m, term, loc)): m
+             for m in ADAPTERS}
     deadline = time.time() + SEARCH_BUDGET
     pending = set(tasks)
     while pending:
