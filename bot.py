@@ -1073,19 +1073,28 @@ async def post_init(app: Application) -> None:
 
 def main():
     load_dotenv()
-    token = (os.getenv("BOT_TOKEN") or "").strip().strip('"\'')
+    # Telegram allows ONE poller per token, so a local run and the deployed one
+    # evict each other every few seconds. --dev points at a second bot from
+    # @BotFather instead, letting both run at once.
+    dev = "--dev" in sys.argv
+    var = "DEV_BOT_TOKEN" if dev else "BOT_TOKEN"
+    token = (os.getenv(var) or "").strip().strip('"\'')
     if not token or token == "paste-here":
         # Name both fixes: on a host there is no .env, and pointing at one
         # sends you looking for a file that does not exist.
         sys.exit(
-            "BOT_TOKEN not set.\n"
-            "  Locally: put it in .env  ->  BOT_TOKEN=8123456789:AAF...\n"
+            f"{var} not set.\n"
+            f"  Locally: put it in .env  ->  {var}=8123456789:AAF...\n"
             "  On a host (Railway/Fly): set BOT_TOKEN as a service environment\n"
             "  variable, then redeploy -- variables are injected at container\n"
-            "  start, so an already-running container will not pick it up.")
+            "  start, so an already-running container will not pick it up."
+            + ("\n  --dev needs a SECOND bot from @BotFather, not the same "
+               "token." if dev else ""))
     if ":" not in token:
-        sys.exit(f"BOT_TOKEN looks malformed ({token[:6]}...). Expected "
+        sys.exit(f"{var} looks malformed ({token[:6]}...). Expected "
                  "<digits>:<letters>, e.g. 8123456789:AAF...")
+    if dev:
+        log.info("DEV MODE — using DEV_BOT_TOKEN, db=%s", DB_PATH)
 
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))

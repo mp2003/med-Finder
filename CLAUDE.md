@@ -14,6 +14,12 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 # Run (long polling; needs BOT_TOKEN in .env)
 .venv/bin/python bot.py
 
+# Run against the DEV bot instead -- use this whenever the deployment is live.
+# Telegram allows ONE poller per token, so a local run on the production token
+# and the deployed one evict each other every few seconds.
+.venv/bin/python bot.py --dev              # reads DEV_BOT_TOKEN
+DB_PATH=dev.db .venv/bin/python bot.py --dev   # ...and a scratch database
+
 # Health-check ONE adapter against its live endpoint — this is the test suite
 .venv/bin/python -m adapters.onemg      # also exercises the latlng resolver
 .venv/bin/python -m adapters.apollo
@@ -150,17 +156,22 @@ check whether the rejection even depends on what you sent.
 Instamart also throttles as **HTTP 200 with a ~31-byte `{"statusCode":429}`
 body** — it looks like success and parses as empty.
 
-**4. Only one bot process may poll at a time.** Telegram allows a single
+**4. Only one bot process may poll per TOKEN.** Telegram allows a single
 `getUpdates` consumer per token; a second instance evicts the first every few
-seconds, and both log `Conflict: terminated by other getUpdates request`. If you
-are already running the bot in a terminal, do not start another — check first:
+seconds, and both log `Conflict: terminated by other getUpdates request`. This
+is server-side and keyed on the token itself, so no amount of env juggling
+separates two runs of the same bot.
+
+Since the deployment went live, **local runs must use `--dev`** (a second bot
+from @BotFather via `DEV_BOT_TOKEN`). Same code, different bot, no conflict.
 
 ```bash
-ps -eo pid,etime,command | grep "[b]ot.py"
+.venv/bin/python bot.py --dev
+ps -eo pid,etime,command | grep "[b]ot.py"   # what is already running
 ```
 
-`on_error` logs this once rather than every poll, so a quiet log does not mean
-only one is running.
+`on_error` logs the conflict once rather than every poll, so a quiet log does
+not mean only one is running.
 
 ## Result semantics
 
