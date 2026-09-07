@@ -37,6 +37,8 @@ log = logging.getLogger(__name__)
 # the handshake is cracked -- loc is already threaded through for that day.
 SEARCH_URL = "https://instamart.in/api/instamart/search/v2"
 PRODUCT_URL = "https://instamart.in/item/{pid}"
+# variations[0].imageIds[] are CDN ids, not URLs; this prefix makes them load.
+IMAGE_BASE = "https://media-assets.swiggy.com/swiggy/image/upload/"
 DEFAULT_STORE = "1404884"
 PLATFORM = "Instamart"
 # ---------------------------------------------------------------------------
@@ -99,7 +101,9 @@ async def search(query: str, loc: Location) -> list[ProductResult]:
             name = it.get("displayName") or ""
             if not name:
                 continue
-            price = (it.get("variations") or [{}])[0].get("price") or {}
+            var = (it.get("variations") or [{}])[0]
+            price = var.get("price") or {}
+            img_ids = var.get("imageIds") or []
             out.append(ProductResult(
                 platform=PLATFORM,
                 name=name,
@@ -111,6 +115,7 @@ async def search(query: str, loc: Location) -> list[ProductResult]:
                 eta=None,
                 url=PRODUCT_URL.format(pid=it.get("productId") or ""),
                 match_score=score(query, name),
+                image=f"{IMAGE_BASE}{img_ids[0]}" if img_ids else None,
             ))
         return top_matches(query, out)
     except Exception as e:

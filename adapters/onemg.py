@@ -58,6 +58,7 @@ async def search(query: str, loc: Location) -> list[ProductResult]:
                 eta=strip_tags(it.get("eta")),
                 url=url if url.startswith("http") else BASE + url,
                 match_score=score(query, it.get("name") or ""),
+                image=it.get("image"),  # already an absolute gumlet URL
             ))
         return top_matches(query, out)
     except Exception as e:

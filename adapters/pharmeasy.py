@@ -56,6 +56,7 @@ async def search(query: str, loc: Location) -> list[ProductResult]:
                 eta=it.get("edd") or None,
                 url=PRODUCT_URL.format(slug=it.get("slug") or ""),
                 match_score=score(query, name),
+                image=it.get("image"),  # absolute cdn01.pharmeasy.in URL
             ))
         return top_matches(query, out)
     except Exception as e:

@@ -90,6 +90,8 @@ async def search(query: str, loc: Location) -> list[ProductResult]:
                 eta=_text(c.get("eta_identifier")) or None,
                 url=PRODUCT_URL.format(prid=prid),
                 match_score=score(query, name),
+                # {"image": {"url": "https://cdn.grofers.com/..."}}
+                image=(c.get("image") or {}).get("url"),
             ))
         return top_matches(query, out)
     except Exception as e:

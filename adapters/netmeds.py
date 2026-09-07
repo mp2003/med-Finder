@@ -37,6 +37,9 @@ async def search(query: str, loc: Location) -> list[ProductResult]:
         for it in data.get("items") or []:
             price = it.get("price") or {}
             name = it.get("name") or ""
+            # medias[] mixes images and video; take the first image entry.
+            img = next((m.get("url") for m in (it.get("medias") or [])
+                        if isinstance(m, dict) and m.get("type") == "image"), None)
             out.append(ProductResult(
                 platform=PLATFORM,
                 name=name,
@@ -46,6 +49,7 @@ async def search(query: str, loc: Location) -> list[ProductResult]:
                 eta=None,  # not in the search payload; don't invent one
                 url=PRODUCT_URL.format(slug=it.get("slug") or ""),
                 match_score=score(query, name),
+                image=img,
             ))
         return top_matches(query, out)
     except Exception as e:

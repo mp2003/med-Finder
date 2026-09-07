@@ -20,6 +20,8 @@ AUTH = "Oeu324WMvfKOj5KMJh2Lkf00eW1"
 SOURCE = "PHARMA_AP_IN"
 # /otc/<urlKey> is canonical; /medicine/<urlKey> 308-redirects to it.
 PRODUCT_URL = "https://www.apollopharmacy.in/otc/{url_key}"
+# thumbnail is a relative catalog path ("/catalog/product/D/O/DOL0026_1_1.jpg").
+IMAGE_BASE = "https://newassets.apollo247.com/pub/media"
 IN_STOCK = "in-stock"  # the bundle's own SEARCH_ITEM_INSTOCK_STATUS constant
 PLATFORM = "Apollo"
 # ---------------------------------------------------------------------------
@@ -44,6 +46,7 @@ async def search(query: str, loc: Location) -> list[ProductResult]:
         out = []
         for it in products:
             name = it.get("name") or ""
+            thumb = it.get("thumbnail") or ""
             out.append(ProductResult(
                 platform=PLATFORM,
                 name=name,
@@ -53,6 +56,7 @@ async def search(query: str, loc: Location) -> list[ProductResult]:
                 eta=it.get("deliveryTime") or None,
                 url=PRODUCT_URL.format(url_key=it.get("urlKey") or ""),
                 match_score=score(query, name),
+                image=f"{IMAGE_BASE}{thumb}" if thumb.startswith("/") else None,
             ))
         return top_matches(query, out)
     except Exception as e:

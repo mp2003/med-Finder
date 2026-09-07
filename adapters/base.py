@@ -37,6 +37,10 @@ class ProductResult:
     eta: str | None
     url: str
     match_score: float
+    # Product photo, absolute URL. Optional: DMart ships an imageKey whose CDN
+    # form we could not resolve, so its results carry None and simply render
+    # without a picture.
+    image: str | None = None
     # False => shares no brand/molecule token with the query, so it is a
     # SIMILAR item, never "the product you asked for".
     is_match: bool = True
