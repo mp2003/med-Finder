@@ -6,6 +6,7 @@ import asyncio
 import html
 import logging
 import os
+import re
 import sys
 import time
 
@@ -13,6 +14,7 @@ from dotenv import load_dotenv
 from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
                       KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove,
                       Update)
+from telegram.error import BadRequest, Conflict
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
@@ -22,31 +24,39 @@ from adapters.base import Location, ProductResult, eta_minutes
 from adapters.onemg import resolve_latlng
 from config import CACHE_TTL, PRESETS, SEARCH_BUDGET
 from matching import normalize, typo_ok
+from parsing import extract_items, search_term
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                     level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("medfinder")
 
+# Conflict repeats every poll; warn once rather than flood the log.
+_conflict_warned = False
+
 # key=(normalized_query, pincode) -> (results, timestamp). In-process is enough
 # for a handful of users; ponytail: swap for Redis only if this ever runs multi-process.
 _cache: dict[tuple[str, str], tuple[list[ProductResult], float]] = {}
 
-DISCLAIMER = ("Prices/availability come from the platforms and can be stale — "
-              "this is a personal convenience tool.")
+DISCLAIMER = ("Prices and availability are read from each platform at the time "
+              "you search and can change before you order. Confirm on the "
+              "platform's own page before placing an order.")
 
 
 # ---------------------------------------------------------------- keyboards
 def preset_keyboard() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(f"📍 {p['name']} ({p['pincode']})",
+    rows = [[InlineKeyboardButton(f"{p['name']} — {p['pincode']}",
                                   callback_data=f"loc:{i}")]
             for i, p in enumerate(PRESETS)]
     return InlineKeyboardMarkup(rows)
 
 
 LIVE_LOCATION_KB = ReplyKeyboardMarkup(
-    [[KeyboardButton("📡 Share my live location", request_location=True)]],
+    [[KeyboardButton("Share my current location", request_location=True)]],
     resize_keyboard=True, one_time_keyboard=True)
+
+ASK_PRODUCT = ("Send the <b>product name</b> you want to check.\n\n"
+               "For example: <code>Dolo 650</code>")
 
 
 async def ask_location(update: Update, prefix: str = ""):
@@ -57,10 +67,13 @@ async def ask_location(update: Update, prefix: str = ""):
     beyond a hint, and the greeting is folded into the first.
     """
     chat = update.effective_chat
-    await chat.send_message(f"{prefix}📍 <b>Pick a location</b>",
-                            parse_mode="HTML", reply_markup=preset_keyboard())
-    await chat.send_message("…or tap below to share your live location 👇",
-                            reply_markup=LIVE_LOCATION_KB)
+    await chat.send_message(
+        f"{prefix}<b>Select a delivery location</b>\n"
+        "Stock and delivery times are checked for the branch you pick.",
+        parse_mode="HTML", reply_markup=preset_keyboard())
+    await chat.send_message(
+        "If you are somewhere else, share your current location instead.",
+        reply_markup=LIVE_LOCATION_KB)
 
 
 # ---------------------------------------------------------------- commands
@@ -69,11 +82,15 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if loc:
         # Already set up: don't re-ask, just confirm and get out of the way.
         return await update.message.reply_text(
-            f"👋 <b>MedFinder</b>\nSaved location: {html.escape(loc.name)} "
-            f"({loc.pincode}).\nSend a product name, or /location to change it.",
+            f"Delivery location is set to <b>{html.escape(loc.name)}</b> "
+            f"({loc.pincode}).\n\n{ASK_PRODUCT}\n\n"
+            "Use /location to deliver to a different branch.",
             parse_mode="HTML")
-    await ask_location(update, "👋 <b>MedFinder</b> — send a product name and "
-                               "I'll compare platforms near you.\n\n")
+    await ask_location(
+        update,
+        "<b>MedFinder</b> checks a product across "
+        f"{len(ADAPTERS)} pharmacy and grocery platforms, and reports where it "
+        "is in stock, at what price, and how soon it arrives.\n\n")
 
 
 async def cmd_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -85,24 +102,31 @@ async def cmd_where(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/where -- show the saved location, or prompt if none is set."""
     loc = await db.get_location(update.effective_chat.id)
     if not loc:
-        return await ask_location(update, "No location saved yet.\n")
+        return await ask_location(update, "No delivery location saved yet.\n\n")
     await update.message.reply_text(
-        f"📍 {html.escape(loc.name)} — {loc.pincode} ({html.escape(loc.city)})",
-        parse_mode="HTML")
+        f"Delivering to <b>{html.escape(loc.name)}</b>\n"
+        f"{loc.pincode}, {html.escape(loc.city)}\n\n"
+        "Use /location to change it.", parse_mode="HTML")
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/help -- usage plus the price-staleness disclaimer."""
     await update.message.reply_text(
-        "Send any medicine name (e.g. <code>dolo 650</code>) and I'll check "
-        "each platform for stock, price and ETA near your saved location.\n\n"
-        "/location — change location\n/where — show saved location\n\n"
+        "<b>How this works</b>\n\n"
+        "Send a product name. You will be asked whether to rank the results by "
+        "delivery speed or by price, then shown every platform that has it, "
+        "with the price and pack size on each button. Tapping a button opens "
+        "that product page.\n\n"
+        "<b>Commands</b>\n"
+        "/location — change the delivery branch\n"
+        "/where — show the current branch\n\n"
         f"<i>{DISCLAIMER}</i>", parse_mode="HTML")
 
 
 async def unknown_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Any unrecognised /command."""
-    await update.message.reply_text("Unknown command — try /help")
+    await update.message.reply_text(
+        "That command is not recognised. Send /help to see what is available.")
 
 
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -114,12 +138,22 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     reaching here is the bot itself: a network drop or a Telegram API error.
     """
     err = ctx.error
+    if isinstance(err, Conflict):
+        # Two bot processes polling the same token evict each other every few
+        # seconds. Say it once, plainly, instead of flooding the log.
+        global _conflict_warned
+        if not _conflict_warned:
+            _conflict_warned = True
+            log.error("Another instance of this bot is already polling. "
+                      "Stop one of them -- only one can run per token.")
+        return
     log.error("handler error: %s: %s", type(err).__name__, err)
     # Best effort -- if the failure WAS the network, this send fails too.
     chat = getattr(update, "effective_chat", None)
     if chat:
         try:
-            await chat.send_message("Something went wrong — please try again.")
+            await chat.send_message(
+                "Something went wrong on our side. Please try that again.")
         except Exception:
             pass
 
@@ -127,14 +161,35 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------- location
 async def on_preset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     p = PRESETS[int(q.data.split(":")[1])]
     loc = Location(p["name"], p["lat"], p["lon"], p["pincode"], p["city"],
                    p.get("im_store"))
+    # Toast at the top of the chat -- instant feedback on the tap itself.
+    await q.answer(f"{loc.name} selected", show_alert=False)
     await db.set_location(q.message.chat_id, loc)
+    # Arrived here from "Check another branch": re-run that search rather than
+    # making the user retype the product name.
+    repeat = ctx.user_data.pop("branch_query", None)
+    if repeat:
+        await q.edit_message_text(
+            f"Location selected: <b>{html.escape(loc.name)}</b>",
+            parse_mode="HTML")
+        await q.message.reply_text(
+            f"<b>{html.escape(loc.name)}</b> is now your delivery location.\n"
+            f"{loc.pincode}, {html.escape(loc.city)}\n\n"
+            f"Re-checking <b>{html.escape(repeat[0])}</b>.", parse_mode="HTML")
+        return await do_search(q.message, repeat[0], q.message.chat_id,
+                               urgent=repeat[1], ctx=ctx)
+    # Retire the picker, then send the confirmation as its OWN message: an
+    # in-place edit is easy to miss if the picker has scrolled out of view.
     await q.edit_message_text(
-        f"✅ Location set: <b>{html.escape(loc.name)}</b> — {loc.pincode}\n"
-        "Now send me a medicine name.", parse_mode="HTML")
+        f"Location selected: <b>{html.escape(loc.name)}</b>", parse_mode="HTML")
+    await q.message.reply_text(
+        f"<b>{html.escape(loc.name)}</b> is now your delivery location.\n"
+        f"{loc.pincode}, {html.escape(loc.city)}\n\n{ASK_PRODUCT}",
+        parse_mode="HTML",
+        # Retire the "Share my current location" keyboard the picker put up.
+        reply_markup=ReplyKeyboardRemove())
 
 
 async def on_live_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -145,85 +200,259 @@ async def on_live_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     resolved = await resolve_latlng(lat, lon)
     if not resolved:
         return await update.message.reply_text(
-            "Couldn't resolve that location. Please pick a preset instead:",
-            reply_markup=preset_keyboard())
+            "That location could not be resolved. Please choose one of the "
+            "branches instead.", reply_markup=preset_keyboard())
     city, pincode = resolved
-    loc = Location("My location", lat, lon, pincode, city)
+    loc = Location("Shared location", lat, lon, pincode, city)
     await db.set_location(update.message.chat_id, loc)
     await update.message.reply_text(
-        f"✅ Location set: <b>My location</b> — {pincode} ({html.escape(city)})\n"
-        "Now send me a medicine name.", parse_mode="HTML",
+        f"Delivery location set to <b>{pincode}, {html.escape(city)}</b>.\n"
+        "Quick-commerce stock is approximate for a shared location; choose a "
+        f"branch for exact availability.\n\n{ASK_PRODUCT}", parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove())
 
 
 # ---------------------------------------------------------------- search
-def _rank(mod, done: dict, urgent: bool):
-    """Sort key: best line first, by ETA when urgent, else by price.
+_PACK = re.compile(r"\(([^)]{1,22})\)\s*$")
 
-    Platforms still being checked, or with nothing to show, sort to the bottom
-    so the board's top line is always an answer rather than a spinner.
+
+def _pack(name: str) -> str:
+    """Pack size, when the adapter appended one: 'Dolo 650 (15 tabs)'.
+
+    Matters for comparison -- Rs 25 for 10 tablets is not cheaper than Rs 31
+    for 15, but a bare price makes it look that way.
     """
-    results = done.get(mod.PLATFORM)
-    if not results:
-        return (2, 0, 0)
-    r = results[0]
-    if not (r.is_match and r.available):
-        return (1, 0, 0)
+    m = _PACK.search(name or "")
+    return m.group(1) if m else ""
+
+
+def _bucket(query: str, done: dict) -> tuple[list, list, list, list, list]:
+    """Split the fan-out into (in stock, closest, missing, pending, out of stock).
+
+    Buckets carry (platform, ProductResult) so the caller can build both the
+    button and the summary line from one pass.
+    """
+    stocked, closest, missing, pending, oos = [], [], [], [], []
+    for mod in ADAPTERS:
+        p = mod.PLATFORM
+        if p not in done:
+            pending.append(p)
+            continue
+        results = done[p]
+        if not results:            # None (failed) or [] (nothing returned)
+            missing.append(p)
+            continue
+        r = results[0]
+        if r.is_match and r.available:
+            stocked.append((p, r))
+        elif r.is_match:
+            # Carried, just not right now -- distinct from "not stocked".
+            oos.append(p)
+        elif typo_ok(query, r.name):
+            # One edit from the query: a mistyped name, not a different
+            # product. Offered separately so it never reads as a confident hit.
+            closest.append((p, r))
+        else:
+            missing.append(p)
+    return stocked, closest, missing, pending, oos
+
+
+def _label(platform: str, r: ProductResult) -> str:
+    """Button caption. Telegram truncates long labels, so keep it tight."""
+    bits = [platform]
+    if r.price is not None:
+        bits.append(f"Rs {r.price:g}")
+    pack = _pack(r.name)
+    if pack:
+        bits.append(pack)
+    eta = _eta_text(r.eta) if r.eta else ""
+    if eta:
+        bits.append(eta)
+    return "  ".join(bits)
+
+
+# Blinkit ships an internal delivery-class name rather than minutes. These are
+# engineering labels, not user copy. Only the quick-commerce ones say anything
+# about speed -- "longtail" and "pharma_rx" are catalogue tags, so they are
+# dropped rather than dressed up as a delivery promise.
+_FAST_WORDS = {"express", "instant", "earliest", "unicorn", "superfast",
+               "rocket", "flash"}
+_TAG_WORDS = {"longtail", "pharma_rx", "standard"}
+
+
+def _eta_text(eta: str) -> str:
+    """Human wording for an ETA, without inventing a number we do not have."""
+    e = eta.strip().lower()
+    if e in _FAST_WORDS:
+        return "under 30 min"
+    if e in _TAG_WORDS:
+        return ""            # says nothing about timing; show no ETA at all
+    return eta.strip()
+
+
+def results_keyboard(query: str, done: dict, urgent: bool) -> InlineKeyboardMarkup:
+    """A button per alternative supplier, plus a branch switch.
+
+    The best fit is described in full in the caption, so it is not repeated
+    here -- these buttons are the OTHER places you could buy it.
+    """
+    ranked = _ranked(query, done, urgent)
+    rows = []
+    if ranked and ranked[0][1].url:
+        # The winner still needs a way to open it -- labelled so it is clearly
+        # the one the caption just described.
+        rows.append([InlineKeyboardButton(
+            f"Open on {ranked[0][0]}", url=ranked[0][1].url)])
+    rows += [[InlineKeyboardButton(_label(p, r), url=r.url)]
+             for p, r in ranked[1:] if r.url]
+    rows.append([InlineKeyboardButton("Check another branch",
+                                      callback_data="branch")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _sort_key(r: ProductResult, urgent: bool):
+    """Soonest-first or cheapest-first, with the other field as tie-break."""
     price = r.price if r.price is not None else float("inf")
     eta = eta_minutes(r.eta)
-    return (0, eta, price) if urgent else (0, price, eta)
+    return (eta, price) if urgent else (price, eta)
+
+
+CAPTION_LIMIT = 1024   # Telegram's cap on a photo caption (text allows 4096)
+
+
+def _ranked(query: str, done: dict, urgent: bool):
+    """Every offer worth showing, best first: exact hits then near-matches.
+
+    Near-matches trail exact ones so a mistyped query can never promote a
+    "did you mean" result above a product we actually matched.
+    """
+    stocked, closest, _, _, _ = _bucket(query, done)
+    stocked.sort(key=lambda pr: _sort_key(pr[1], urgent))
+    closest.sort(key=lambda pr: _sort_key(pr[1], urgent))
+    return stocked + closest
+
+
+def _best_block(r: ProductResult, exact: bool) -> str:
+    """The recommendation, written out. Everything else is a button."""
+    head = "BEST OPTION" if exact else "CLOSEST MATCH"
+    # Cap the name: some listings run to hundreds of characters, and the whole
+    # block has to fit a 1024-char photo caption alongside everything else.
+    name = r.name if len(r.name) <= 120 else r.name[:117].rstrip() + "..."
+    # Labelled rows, one fact each: the eye can find "Price" or "Delivery"
+    # without reading the whole block. Labels stay plain, values carry the
+    # emphasis, so the values are what stands out.
+    out = [f"<b>{head}</b>",
+           f"Product    <b>{html.escape(name)}</b>",
+           f"Supplier   <b><u>{html.escape(r.platform)}</u></b>"]
+
+    # Delivery before price: when someone needs a medicine, when it arrives is
+    # the deciding fact.
+    eta = _eta_text(r.eta) if r.eta else ""
+    out.append(f"Delivery   <b>{html.escape(eta)}</b>" if eta
+               else "Delivery   <b>not published by this platform</b>")
+
+    if r.price is not None:
+        money = f"<b>Rs {r.price:g}</b>"
+        # Show the strike-through only for a discount worth noticing; a 3%
+        # gap is rounding, and dressing it up as a saving is noise.
+        if r.mrp and r.mrp > r.price and (1 - r.price / r.mrp) >= 0.05:
+            money += (f"   <s>Rs {r.mrp:g}</s>   "
+                      f"<b>{(1 - r.price / r.mrp) * 100:.0f}% off</b>")
+        out.append(f"Price      {money}")
+    else:
+        out.append("Price      <b>not listed</b>")
+
+    pack = _pack(r.name)
+    if pack:
+        out.append(f"Pack       <b>{html.escape(pack)}</b>")
+    out.append("Stock      <b>Available</b>")
+
+    if not exact:
+        out.append("\n<i>Not an exact match — check the name before "
+                   "ordering.</i>")
+    return "\n".join(out)
 
 
 def render(query: str, loc: Location, done: dict, cached: bool,
            urgent: bool = False) -> str:
-    head = (f"🔎 <b>{html.escape(query)}</b> — {html.escape(loc.name)} "
-            f"({loc.pincode})")
-    head += ("\n<i>fastest first</i>" if urgent else "\n<i>cheapest first</i>")
+    """Board text: the winner in full, everything else summarised.
+
+    Kept under CAPTION_LIMIT because this doubles as a photo caption.
+    """
+    stocked, closest, missing, pending, oos = _bucket(query, done)
+    order = "soonest delivery" if urgent else "lowest price"
+    head = (f"<b>{html.escape(query)}</b>\n"
+            f"{html.escape(loc.name)} ({loc.pincode}) — ordered by {order}")
+
     lines = []
-    for mod in sorted(ADAPTERS, key=lambda m: _rank(m, done, urgent)):
-        name = html.escape(mod.PLATFORM)
-        if mod.PLATFORM not in done:
-            lines.append(f"⏳ {name} — checking…")
-            continue
-        results = done[mod.PLATFORM]
-        if results is None:
-            lines.append(f"⚠️ {name} — check failed")
-        elif not results:
-            lines.append(f"❌ {name} — not found")
-        else:
-            r = results[0]
-            link = (f'<a href="{html.escape(r.url, quote=True)}">'
-                    f'{html.escape(r.name)}</a>')
-            price = f"₹{r.price:g}" if r.price is not None else "price n/a"
-            eta = f" ({html.escape(r.eta)})" if r.eta else ""
-            if not r.is_match and typo_ok(query, r.name):
-                # Failed the identity gate, but every identifying token is one
-                # edit from the title -- a mistyped query, not a different
-                # product. Still not asserted as a match: the user confirms by
-                # reading the name.
-                lines.append(f"❓ {name} — did you mean {link}? — "
-                             f"{price}{eta}")
-            elif not r.is_match:
-                # No real match: say so plainly, then offer the closest item.
-                lines.append(f"❌ {name} — not found. Similar: {link} — "
-                             f"{price}{eta}")
-            elif not r.available:
-                lines.append(f"❌ {name} — {link} is out of stock")
-                alt = next((a for a in results[1:] if a.available), None)
-                if alt:
-                    ap = f"₹{alt.price:g}" if alt.price is not None else "price n/a"
-                    lines.append(f"   ↳ in stock: "
-                                 f'<a href="{html.escape(alt.url, quote=True)}">'
-                                 f'{html.escape(alt.name)}</a> — {ap}')
-            else:
-                # Be explicit when a platform gives no ETA: under "fastest
-                # first" a silent omission reads as fast, which it is not.
-                shown = eta or (" (delivery time n/a)" if urgent else "")
-                lines.append(f"✅ {name} — {price}{shown} — {link}")
-    for mod in COMING_SOON:
-        lines.append(f"⚠️ {html.escape(mod.PLATFORM)} — coming soon")
-    foot = "\n\n<i>cached</i>" if cached else ""
-    return head + "\n" + "\n".join(lines) + foot
+    ranked = _ranked(query, done, urgent)
+    if ranked:
+        best_platform, best = ranked[0]
+        lines.append(_best_block(best, exact=bool(stocked)))
+        others = len(ranked) - 1
+        if others:
+            lines.append(f"Also available from {others} other "
+                         f"{'supplier' if others == 1 else 'suppliers'} — "
+                         "tap to open:")
+        priced = [r for _, r in ranked if r.price is not None]
+        if len(priced) > 1:
+            lo = min(priced, key=lambda r: r.price)
+            hi = max(priced, key=lambda r: r.price)
+            # Only worth saying when the gap would actually change a decision;
+            # "Rs 0.10 below the highest" is noise.
+            if (lo.platform != best.platform
+                    and hi.price - lo.price >= 5):
+                lines.append(f"<u>{html.escape(lo.platform)}</u> is cheapest "
+                             f"overall at "
+                             f"Rs {lo.price:g}, Rs {hi.price - lo.price:.2f} "
+                             "below the highest.")
+    if closest and stocked:
+        lines.append(f"No exact match on {_join([p for p, _ in closest])}, but a "
+                     f"close product was found — check the name before ordering.")
+    if not stocked and not closest and not pending:
+        lines.append(
+            f"Currently out of stock at {_join(oos)}, and not carried elsewhere."
+            if oos else
+            f"Not found on any of the {len(ADAPTERS)} platforms checked.")
+    elif oos:
+        lines.append(f"Carried but out of stock at {_join(oos)}.")
+    if missing:
+        lines.append(f"Not stocked at {_join(missing)}.")
+    soon = [m.PLATFORM for m in COMING_SOON]
+    if soon:
+        lines.append(f"Not yet supported: {_join(soon)}.")
+
+    foot = "\n\nShowing recent results." if cached else ""
+    out = head + "\n\n" + "\n\n".join(lines) + foot
+    # Drop trailing summary lines rather than cut mid-tag and break the HTML
+    # parse -- but never the first line, which carries the recommendation.
+    while len(out) > CAPTION_LIMIT and len(lines) > 1:
+        lines.pop()
+        out = head + "\n\n" + "\n\n".join(lines) + foot
+    return out
+
+
+def _join(names: list[str]) -> str:
+    """'A', 'A and B', 'A, B and C' -- reads as prose, not a CSV dump.
+
+    Platform names are underlined wherever they appear, so they stand out from
+    the surrounding sentence.
+    """
+    names = [f"<u>{html.escape(n)}</u>" for n in names]
+    if len(names) <= 1:
+        return "".join(names)
+    return ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def best_image(query: str, done: dict, urgent: bool) -> str | None:
+    """Photo of the top result, if any platform supplied one.
+
+    Not every product has an image on every platform (PharmEasy's Dolo Xtraa
+    has none), so this walks the ranked results and takes the first that does.
+    """
+    stocked, closest, _, _, _ = _bucket(query, done)
+    ranked = sorted(stocked + closest, key=lambda pr: _sort_key(pr[1], urgent))
+    return next((r.image for _, r in ranked if r.image), None)
 
 
 async def ask_urgency(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -233,16 +462,24 @@ async def ask_urgency(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     loc = await db.get_location(update.effective_chat.id)
     if not loc:
-        return await ask_location(update, "Pick a location first.\n")
+        return await ask_location(
+            update, "Choose a delivery location before searching.\n\n")
+
+    # An order message names several things; a plain search names one. Two or
+    # more items takes the list flow, one keeps today's behaviour exactly.
+    items = extract_items(query)
+    if len(items) > 1:
+        return await confirm_list(update, ctx, items)
 
     # Keyed per chat so a second search cannot answer the first one's prompt.
     ctx.user_data["pending_query"] = query
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🚨 Yes — need it fast", callback_data="urg:1"),
-        InlineKeyboardButton("💰 No — cheapest", callback_data="urg:0"),
-    ]])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Soonest delivery", callback_data="urg:1")],
+        [InlineKeyboardButton("Lowest price", callback_data="urg:0")],
+    ])
     await update.message.reply_text(
-        f"🔎 <b>{html.escape(query)}</b>\nIs it needed urgently?",
+        f"<b>{html.escape(query)}</b>\n\n"
+        "How should the results be ordered?",
         reply_markup=kb, parse_mode="HTML")
 
 
@@ -252,34 +489,89 @@ async def on_urgency(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     query = ctx.user_data.pop("pending_query", None)
     if not query:
-        return await q.edit_message_text("That search expired — send the name again.")
+        return await q.edit_message_text(
+            "That search has expired. Send the product name again.")
     await q.edit_message_reply_markup(reply_markup=None)
     await do_search(q.message, query, update.effective_chat.id,
-                    urgent=q.data == "urg:1")
+                    urgent=q.data == "urg:1", ctx=ctx)
 
 
-async def do_search(message, query: str, chat_id: int, urgent: bool):
+async def on_branch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """'Check another branch' -> pick a location, then re-run the same query."""
+    q = update.callback_query
+    await q.answer()
+    last = ctx.user_data.get("last_search")
+    if not last:
+        return await q.message.reply_text(
+            "Send the product name again to run a new search.")
+    ctx.user_data["branch_query"] = last
+    await q.message.reply_text(
+        f"Checking <b>{html.escape(last[0])}</b> at a different branch.\n"
+        "Select the delivery location.",
+        parse_mode="HTML", reply_markup=preset_keyboard())
+
+
+async def do_search(message, query: str, chat_id: int, urgent: bool, ctx=None):
     """Fan out to every live adapter and edit the board as each one lands.
 
     Serves from cache when fresh. Takes an explicit message/query rather than
     an Update, since it is driven by the urgency callback, not a raw message.
+    ctx is optional so the "check another branch" button can remember what to
+    re-run.
     """
     loc = await db.get_location(chat_id)
     if not loc:
         return
+    if ctx is not None:
+        ctx.user_data["last_search"] = (query, urgent)
+
+    async def finish(done: dict, cached: bool):
+        """Replace the placeholder with the final board.
+
+        Sent as ONE photo message when an image exists -- caption and buttons
+        ride along, so the picture is always above the text. A text message
+        cannot be edited into a photo one, hence the delete-and-resend.
+        """
+        text = render(query, loc, done, cached=cached, urgent=urgent)
+        kb = results_keyboard(query, done, urgent)
+        img = best_image(query, done, urgent)
+        if img:
+            try:
+                await message.reply_photo(img, caption=text, parse_mode="HTML",
+                                          reply_markup=kb)
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass            # placeholder too old to delete; harmless
+                return
+            except Exception as e:  # dead CDN link must not lose the board
+                log.info("photo send failed, falling back to text: %s", e)
+        try:
+            await msg.edit_text(text, parse_mode="HTML",
+                                disable_web_page_preview=True, reply_markup=kb)
+        except BadRequest as e:
+            # "Message is not modified" -- a platform returned nothing, so the
+            # board is byte-identical to the last edit. Expected, not an error.
+            if "not modified" not in str(e).lower():
+                raise
 
     key = (normalize(query), loc.pincode)
     hit = _cache.get(key)
     if hit and time.time() - hit[1] < CACHE_TTL:
         done = {m.PLATFORM: [r for r in hit[0] if r.platform == m.PLATFORM]
                 for m in ADAPTERS}
-        return await message.reply_text(
+        msg = await message.reply_text(
             render(query, loc, done, cached=True, urgent=urgent),
             parse_mode="HTML", disable_web_page_preview=True)
+        return await finish(done, cached=True)
 
+    # A single static notice while the fan-out runs. The board used to be
+    # re-rendered on every adapter that landed, which made the message twitch
+    # and reshuffle under the reader -- now it is drawn once, at the end.
     msg = await message.reply_text(
-        render(query, loc, {}, cached=False, urgent=urgent), parse_mode="HTML",
-        disable_web_page_preview=True)
+        f"Checking <b>{html.escape(query)}</b> across {len(ADAPTERS)} "
+        f"platforms for {html.escape(loc.name)}.\nOne moment.",
+        parse_mode="HTML", disable_web_page_preview=True)
 
     done: dict[str, list | None] = {}
     tasks = {asyncio.create_task(m.search(query, loc)): m for m in ADAPTERS}
@@ -300,13 +592,6 @@ async def do_search(message, query: str, chat_id: int, urgent: bool):
             except Exception as e:
                 log.warning("%s task failed: %s", mod.PLATFORM, e)
                 done[mod.PLATFORM] = None
-        try:  # progressive edit; ignore "message is not modified"
-            await msg.edit_text(
-                render(query, loc, done, cached=False, urgent=urgent),
-                parse_mode="HTML", disable_web_page_preview=True)
-        except Exception:
-            pass
-
     for t in pending:  # over budget -> render as failed
         t.cancel()
         done.setdefault(tasks[t].PLATFORM, None)
@@ -315,11 +600,290 @@ async def do_search(message, query: str, chat_id: int, urgent: bool):
     if ok:
         _cache[key] = (ok, time.time())
     try:
-        await msg.edit_text(
-            render(query, loc, done, cached=False, urgent=urgent),
-            parse_mode="HTML", disable_web_page_preview=True)
-    except Exception:
-        pass
+        await finish(done, cached=False)
+    except Exception as e:
+        log.warning("final render failed: %s", e)
+
+
+# ---------------------------------------------------------------- order lists
+async def confirm_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                       items: list[str]):
+    """Show what was extracted before spending a fan-out on it.
+
+    Extraction is a heuristic over human prose, so the user confirms before
+    N items x 7 platforms of live calls run.
+    """
+    ctx.user_data["batch"] = items
+    lines = []
+    for i, it in enumerate(items, 1):
+        term = search_term(it)
+        # Say when the search differs from what was written -- a stripped
+        # strength changes what comes back, and the user should see that.
+        extra = f"   (searching \"{html.escape(term)}\")" if term != it else ""
+        lines.append(f"{i}. <b>{html.escape(it)}</b>{extra}")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Yes, check all {len(items)}",
+                              callback_data="list:go")],
+        [InlineKeyboardButton("Cancel", callback_data="list:no")],
+    ])
+    await update.message.reply_text(
+        f"Found <b>{len(items)} items</b> in that message:\n\n"
+        + "\n".join(lines) + "\n\nIs that right?",
+        parse_mode="HTML", reply_markup=kb)
+
+
+async def on_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Confirmation answered -> ask the one ranking question, or drop it."""
+    q = update.callback_query
+    await q.answer()
+    if q.data == "list:no":
+        ctx.user_data.pop("batch", None)
+        return await q.edit_message_text(
+            "Cancelled. Send the list again, or one product name.")
+    items = ctx.user_data.get("batch")
+    if not items:
+        return await q.edit_message_text(
+            "That list has expired. Send the message again.")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Soonest delivery", callback_data="lurg:1")],
+        [InlineKeyboardButton("Lowest price", callback_data="lurg:0")],
+    ])
+    await q.edit_message_text(
+        f"Checking <b>{len(items)} items</b>.\n\n"
+        "How should the results be ordered?",
+        parse_mode="HTML", reply_markup=kb)
+
+
+async def on_list_urgency(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ranking chosen -> run the fan-out for every item."""
+    q = update.callback_query
+    await q.answer()
+    items = ctx.user_data.get("batch")
+    if not items:
+        return await q.edit_message_text(
+            "That list has expired. Send the message again.")
+    urgent = q.data == "lurg:1"
+    ctx.user_data["batch_urgent"] = urgent
+    loc = await db.get_location(q.message.chat_id)
+    if not loc:
+        return await q.edit_message_text("Set a delivery location first.")
+
+    await q.edit_message_text(
+        f"Checking <b>{len(items)} items</b> across {len(ADAPTERS)} platforms "
+        f"for {html.escape(loc.name)}.\nThis takes a moment.",
+        parse_mode="HTML")
+
+    # Items sequentially, platforms in parallel: these APIs throttle hard and a
+    # burst of N x 7 simultaneous calls gets us rate-limited.
+    results = {}
+    for it in items:
+        results[it] = await _search_one(search_term(it), loc)
+
+    ctx.user_data["batch_results"] = results
+    await _report(q.message, ctx, items, results, urgent)
+
+
+async def _search_one(term: str, loc: Location) -> dict:
+    """One item across every adapter. Mirrors do_search's fan-out and budget."""
+    done: dict[str, list | None] = {}
+    tasks = {asyncio.create_task(m.search(term, loc)): m for m in ADAPTERS}
+    deadline = time.time() + SEARCH_BUDGET
+    pending = set(tasks)
+    while pending:
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        finished, pending = await asyncio.wait(
+            pending, timeout=left, return_when=asyncio.FIRST_COMPLETED)
+        if not finished:
+            break
+        for t in finished:
+            mod = tasks[t]
+            try:
+                done[mod.PLATFORM] = t.result()
+            except Exception as e:
+                log.warning("%s failed for %r: %s", mod.PLATFORM, term, e)
+                done[mod.PLATFORM] = None
+    for t in pending:
+        t.cancel()
+        done.setdefault(tasks[t].PLATFORM, None)
+    return done
+
+
+def _offers(item: str, done: dict) -> dict:
+    """platform -> the best in-stock ProductResult it has for this item."""
+    out = {}
+    for platform, results in (done or {}).items():
+        if not results:
+            continue
+        r = results[0]
+        if r.is_match and r.available:
+            out[platform] = r
+    return out
+
+
+def complete_baskets(items: list[str], results: dict, urgent: bool):
+    """Platforms carrying EVERY item, best first on the chosen axis.
+
+    Returns [(platform, {item: result}, total)]. One order beats three, so a
+    platform that has the lot wins even when another is cheaper on one line.
+    """
+    per_item = {it: _offers(it, results.get(it, {})) for it in items}
+    full = []
+    for platform in {p for offs in per_item.values() for p in offs}:
+        if all(platform in per_item[it] for it in items):
+            picked = {it: per_item[it][platform] for it in items}
+            total = sum(r.price or 0 for r in picked.values())
+            full.append((platform, picked, total))
+    if urgent:
+        full.sort(key=lambda b: (max(eta_minutes(r.eta) for r in b[1].values()),
+                                 b[2]))
+    else:
+        full.sort(key=lambda b: (b[2],
+                                 max(eta_minutes(r.eta) for r in b[1].values())))
+    return full
+
+
+async def _report(message, ctx, items, results, urgent):
+    """One basket if a platform has everything, otherwise item by item."""
+    baskets = complete_baskets(items, results, urgent)
+    order = "soonest delivery" if urgent else "lowest price"
+
+    if baskets:
+        platform, picked, total = baskets[0]
+        lines = [f"All <b>{len(items)} items</b> are available at "
+                 f"<b>{len(baskets)}</b> "
+                 f"{'platform' if len(baskets) == 1 else 'platforms'}.",
+                 "",
+                 f"<b>BEST BASKET — <u>{html.escape(platform)}</u></b>"
+                 f"   (by {order})"]
+        for it in items:
+            r = picked[it]
+            price = f"Rs {r.price:g}" if r.price is not None else "price n/a"
+            lines.append(f"{html.escape(it)} — <b>{price}</b>")
+        lines.append(f"<b>Total   Rs {total:.2f}</b>")
+
+        etas = {_eta_text(r.eta) for r in picked.values() if r.eta}
+        if etas:
+            lines.append(f"Delivery   <b>{html.escape(max(etas, key=len))}</b>")
+        if len(baskets) > 1:
+            others = ", ".join(f"{p} Rs {t:.2f}" for p, _, t in baskets[1:4])
+            lines.append("")
+            lines.append(f"Other complete baskets: {html.escape(others)}")
+        lines.append("")
+        lines.append("Open each item:")
+        for it in items:
+            lines.append(html.escape(picked[it].url))
+
+        # One order, so record the whole basket against this platform.
+        for it in items:
+            r = picked[it]
+            await db.save_pick(message.chat_id, it, platform, r.price, r.url)
+        ctx.user_data.pop("batch", None)
+        return await message.reply_text("\n".join(lines), parse_mode="HTML",
+                                        disable_web_page_preview=True)
+
+    # No single platform has the lot -- walk the items one at a time.
+    missing = [it for it in items if not _offers(it, results.get(it, {}))]
+    intro = [f"No single platform has all {len(items)} items."]
+    if missing:
+        intro.append("Not found anywhere: "
+                     + _join([html.escape(m) for m in missing]) + ".")
+    intro.append("Going through them one at a time.")
+    await message.reply_text("\n\n".join(intro), parse_mode="HTML")
+
+    ctx.user_data["batch_i"] = 0
+    ctx.user_data["batch_picks"] = {}
+    await _next_item(message, ctx)
+
+
+async def _next_item(message, ctx):
+    """Show the next item's board, or the summary when the list is done."""
+    items = ctx.user_data.get("batch") or []
+    i = ctx.user_data.get("batch_i", 0)
+    results = ctx.user_data.get("batch_results") or {}
+    urgent = ctx.user_data.get("batch_urgent", False)
+
+    while i < len(items) and not _offers(items[i], results.get(items[i], {})):
+        i += 1                      # nothing stocks it; nothing to pick
+    if i >= len(items):
+        return await _summary(message, ctx)
+
+    ctx.user_data["batch_i"] = i
+    item = items[i]
+    offers = _offers(item, results.get(item, {}))
+    ranked = sorted(offers.items(), key=lambda kv: _sort_key(kv[1], urgent))
+    ctx.user_data["batch_offers"] = [p for p, _ in ranked]
+
+    rows = [[InlineKeyboardButton(_label(p, r), callback_data=f"pick:{i}:{n}")]
+            for n, (p, r) in enumerate(ranked)]
+    rows.append([InlineKeyboardButton("Skip this item",
+                                      callback_data=f"pick:{i}:x")])
+    await message.reply_text(
+        f"<b>Item {i + 1} of {len(items)}: {html.escape(item)}</b>\n"
+        "Which supplier?", parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def on_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """A supplier chosen for one item -> record it and move on."""
+    q = update.callback_query
+    _, idx, choice = q.data.split(":")
+    i = int(idx)
+    items = ctx.user_data.get("batch") or []
+    if i >= len(items):
+        await q.answer()
+        return await q.edit_message_text("That list has expired.")
+    item = items[i]
+
+    if choice == "x":
+        await q.answer("Skipped")
+        await q.edit_message_text(f"{html.escape(item)} — skipped.",
+                                  parse_mode="HTML")
+    else:
+        platform = (ctx.user_data.get("batch_offers") or [])[int(choice)]
+        r = _offers(item, (ctx.user_data.get("batch_results") or {})
+                    .get(item, {}))[platform]
+        ctx.user_data.setdefault("batch_picks", {})[item] = (platform, r)
+        await db.save_pick(q.message.chat_id, item, platform, r.price, r.url)
+        await q.answer(f"{platform} selected")
+        await q.edit_message_text(
+            f"{html.escape(item)} — <b><u>{html.escape(platform)}</u></b>",
+            parse_mode="HTML")
+
+    ctx.user_data["batch_i"] = i + 1
+    await _next_item(q.message, ctx)
+
+
+async def _summary(message, ctx):
+    """Plain-text recap of what was chosen. No buttons, per the user."""
+    items = ctx.user_data.get("batch") or []
+    picks = ctx.user_data.get("batch_picks") or {}
+    lines = [f"<b>ORDER SUMMARY — {len(items)} items</b>", ""]
+    total = 0.0
+    for n, it in enumerate(items, 1):
+        got = picks.get(it)
+        if not got:
+            lines.append(f"{n}. {html.escape(it)}\n   Not ordered.")
+            continue
+        platform, r = got
+        price = f"Rs {r.price:g}" if r.price is not None else "price n/a"
+        eta = _eta_text(r.eta) if r.eta else ""
+        total += r.price or 0
+        lines.append(f"{n}. <b>{html.escape(it)}</b>\n"
+                     f"   <u>{html.escape(platform)}</u> — {price}"
+                     + (f" — {html.escape(eta)}" if eta else "")
+                     + f"\n   {html.escape(r.url)}")
+        lines.append("")
+    if total:
+        lines.append(f"<b>Total   Rs {total:.2f}</b>")
+        lines.append("<i>Across different platforms — these cannot be "
+                     "ordered together.</i>")
+    for k in ("batch", "batch_i", "batch_picks", "batch_results",
+              "batch_offers", "batch_urgent"):
+        ctx.user_data.pop(k, None)
+    await message.reply_text("\n".join(lines), parse_mode="HTML",
+                             disable_web_page_preview=True)
 
 
 # ---------------------------------------------------------------- main
@@ -357,6 +921,10 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(on_preset, pattern=r"^loc:"))
     app.add_handler(CallbackQueryHandler(on_urgency, pattern=r"^urg:"))
+    app.add_handler(CallbackQueryHandler(on_branch, pattern=r"^branch$"))
+    app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^list:"))
+    app.add_handler(CallbackQueryHandler(on_list_urgency, pattern=r"^lurg:"))
+    app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
     app.add_handler(MessageHandler(filters.LOCATION, on_live_location))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ask_urgency))
