@@ -52,4 +52,13 @@ DELIVERY_COST = 40
 # the maths splits an order to save Rs 10, which is not worth a second delivery
 # to receive and track.
 MEANINGFUL_SAVING = 50
+# A retry (probe or respell) may run past SEARCH_BUDGET by up to this much.
+# The budget exists so the user is not left staring at a spinner, but a search
+# that found NOTHING has nothing to render -- returning "not stocked" on time
+# is worse than an answer a moment later. Only ever spent on a failed search.
+#
+# Sized from the slowest phase timing observed, doubled for a hosted region:
+# the bot runs in US East while every adapter is Indian, so a round trip that
+# takes 0.4s locally can take several times that from the container.
+RETRY_GRACE = 8.0
 MAX_RESULTS = 3          # per platform

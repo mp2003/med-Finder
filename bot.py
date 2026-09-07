@@ -25,7 +25,7 @@ from adapters.base import (ETA_UNKNOWN, QUICK, SLOW, Location, ProductResult,
                            eta_minutes, probe_name, search_wide)
 from adapters.onemg import resolve_latlng
 from config import (CACHE_TTL, DB_PATH, DELIVERY_COST, MEANINGFUL_SAVING,
-                    PRESETS, SEARCH_BUDGET)
+                    PRESETS, RETRY_GRACE, SEARCH_BUDGET)
 from matching import identity_ok, normalize, respell, typo_ok
 from parsing import extract_items, search_term
 
@@ -689,6 +689,17 @@ async def on_list_urgency(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _report(q.message, ctx, items, results, urgent)
 
 
+def _retry_deadline(deadline: float) -> float:
+    """Budget for a retry pass, independent of what the first fan-out spent.
+
+    Retries only run when the search found nothing, so the original deadline is
+    the wrong clock: a slow fan-out would leave the probe no time precisely
+    when the network is slow enough to need it. Deployed in US East against
+    Indian APIs, that is the normal case, not the edge case.
+    """
+    return max(deadline, time.time() + RETRY_GRACE)
+
+
 async def _probe_retry(done: dict, query: str, loc: Location, deadline: float):
     """Second chance when EVERY platform came back empty.
 
@@ -702,8 +713,7 @@ async def _probe_retry(done: dict, query: str, loc: Location, deadline: float):
     """
     if any(done.get(m.PLATFORM) for m in ADAPTERS):
         return done
-    if deadline - time.time() < 2:          # no room left to be useful
-        return done
+    deadline = _retry_deadline(deadline)
     probe = ADAPTERS[0]                     # 1mg: fastest and most tolerant
     try:
         name = await probe_name(probe, query, loc)
@@ -726,8 +736,20 @@ async def _refan(done: dict, query: str, better: str, loc: Location,
     retry does strictly better, so a correction can only add.
     """
     retry = {asyncio.create_task(m.search(better, loc)): m for m in ADAPTERS}
-    left = max(0.0, deadline - time.time())
-    finished, pending = await asyncio.wait(retry, timeout=left)
+    # Collect as each platform lands rather than waiting for the slowest, so a
+    # single stalled adapter cannot cost us the ones that already answered --
+    # the old all-or-nothing wait() threw those away on timeout.
+    finished = set()
+    pending = set(retry)
+    while pending:
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        just, pending = await asyncio.wait(
+            pending, timeout=left, return_when=asyncio.FIRST_COMPLETED)
+        if not just:
+            break
+        finished |= just
     for t in pending:
         t.cancel()
     for t in finished:
@@ -752,8 +774,9 @@ async def _respell_retry(done: dict, query: str, loc: Location,
     from. Correcting and re-asking took "crocine" from 2 results to 15.
     """
     titles = [r.name for v in done.values() if v for r in v]
-    if not titles or deadline - time.time() < 2:
+    if not titles:
         return done
+    deadline = _retry_deadline(deadline)
     better = respell(query, titles)
     if not better:
         return done
@@ -1271,6 +1294,15 @@ def demo():
     assert eta_minutes("pharma_rx", "Blinkit") < ETA_UNKNOWN
     assert eta_minutes(None, "Instamart") < ETA_UNKNOWN
     assert eta_minutes(None, "Netmeds") == ETA_UNKNOWN
+
+    # 6b. A retry must get its own budget, not the leftovers of a slow
+    #     fan-out -- otherwise the probe is starved exactly when the network
+    #     is slow enough to need it. Deployed US East against Indian APIs,
+    #     that is the normal case.
+    now = time.time()
+    assert _retry_deadline(now + 0.1) >= now + RETRY_GRACE, "starved retry"
+    # A generous deadline already in hand is never shortened.
+    assert _retry_deadline(now + 999) == now + 999
 
     # 6. Speed mixing is a platform fact, not an eta fact. An eta-derived
     #    predicate gets Blinkit+Instamart wrong -- Instamart publishes none.
