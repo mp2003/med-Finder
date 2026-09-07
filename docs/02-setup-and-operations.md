@@ -58,6 +58,7 @@ Everything an owner edits is in `config.py`:
 | Constant | Default | Meaning |
 |---|---|---|
 | `PRESETS` | 3 delivery destinations | Each needs `name`, `lat`, `lon`, `pincode`, **`city`**, and `im_store` for exact Instamart stock |
+| `DB_PATH` | `bot.db` | SQLite file. **Override via env on a host** -- see Deployment |
 | `CACHE_TTL` | 900s | In-process cache lifetime |
 | `ADAPTER_TIMEOUT` | 8.0s | Per-platform HTTP timeout |
 | `SEARCH_BUDGET` | 10.0s | Overall fan-out cap |
@@ -77,6 +78,42 @@ app -- Instamart reassigns stores.
 
 Presets are the pharmacy branches and office that stock is delivered **to**, not
 generic neighbourhoods. Every pincode was confirmed against 1mg's own resolver.
+
+## Deployment
+
+Currently running in demo mode. Three things constrain where this can go:
+
+**It must never sleep.** Long polling holds an open connection to Telegram, and
+the bot receives no inbound HTTP at all. Any host that sleeps a service after
+idle HTTP traffic will kill it -- which rules out most "free web service" tiers.
+Render's free tier no longer exists; paid plans start at $7/mo per service.
+
+**`curl_cffi` is a compiled dependency.** Blinkit and Instamart need it for TLS
+impersonation, so the host must run a real container or VM, not a
+pure-Python-wheels sandbox.
+
+**SQLite needs a persistent disk.** `DB_PATH` defaults to a relative `bot.db`,
+which on a container is wiped by every redeploy -- taking the saved branches,
+Instamart store ids and pick history with it. Set it to a mounted volume:
+
+```bash
+DB_PATH=/data/bot.db
+```
+
+`config.py` calls `load_dotenv()` itself rather than relying on `bot.main()`,
+because config is imported at module scope long before main runs -- a `DB_PATH`
+in `.env` would otherwise be read too late and silently ignored.
+
+**Region matters.** Every adapter call goes to an Indian platform inside a 10s
+budget, and some behave differently for foreign IPs. Prefer an Indian region.
+
+Reasonable fits: **Fly.io** (free allowance, real containers, volumes, Indian
+region) or **Oracle Cloud Free Tier** (genuinely free always-on VM, more setup).
+Railway works but is not free beyond trial credit.
+
+Deferred deliberately: webhooks. Long polling needs no public URL or TLS, and
+the switch is contained to the last line of `main()` -- no reason to pay that
+cost before it is needed.
 
 ## Health checks
 

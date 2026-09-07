@@ -908,8 +908,14 @@ def main():
     load_dotenv()
     token = (os.getenv("BOT_TOKEN") or "").strip().strip('"\'')
     if not token or token == "paste-here":
-        sys.exit("BOT_TOKEN not set. Edit .env and replace paste-here with the "
-                 "token from @BotFather, e.g.\n  BOT_TOKEN=8123456789:AAF...")
+        # Name both fixes: on a host there is no .env, and pointing at one
+        # sends you looking for a file that does not exist.
+        sys.exit(
+            "BOT_TOKEN not set.\n"
+            "  Locally: put it in .env  ->  BOT_TOKEN=8123456789:AAF...\n"
+            "  On a host (Railway/Fly): set BOT_TOKEN as a service environment\n"
+            "  variable, then redeploy -- variables are injected at container\n"
+            "  start, so an already-running container will not pick it up.")
     if ":" not in token:
         sys.exit(f"BOT_TOKEN looks malformed ({token[:6]}...). Expected "
                  "<digits>:<letters>, e.g. 8123456789:AAF...")

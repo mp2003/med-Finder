@@ -195,9 +195,15 @@ derived from lat/lon**: set the branch address on instamart.in and read
 `storeId=` out of any request. A preset without one silently falls back to a
 default store, so that branch's Instamart stock is somebody else's.
 
-`.env` holds `BOT_TOKEN` only. The 1mg/Apollo tokens hardcoded in the adapters
-are public web-client constants shipped in those sites' own JS bundles, not user
-secrets — that placement is deliberate.
+`.env` holds `BOT_TOKEN` and optionally `DB_PATH`. **`config.py` calls
+`load_dotenv()` itself** -- it is imported at module scope long before
+`bot.main()` runs, so anything read there must be loaded there or it is silently
+ignored. On a hosted container set `DB_PATH=/data/bot.db` (a mounted volume);
+the default relative path is wiped by every redeploy.
+
+The 1mg/Apollo tokens hardcoded in the adapters are public web-client constants
+shipped in those sites' own JS bundles, not user secrets — that placement is
+deliberate.
 
 ## Git identity
 

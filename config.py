@@ -1,5 +1,14 @@
 """Owner-editable constants. Presets carry city AND pincode: 1mg keys on city,
 Apollo keys on pincode."""
+import os
+
+from dotenv import load_dotenv
+
+# Loaded HERE, not in bot.py: config is imported at module scope, long before
+# bot.main() runs, so a DB_PATH set in .env would otherwise be read too late
+# and silently ignored. Real hosts set env vars directly and have no .env,
+# which load_dotenv handles by doing nothing.
+load_dotenv()
 
 # Delivery destinations -- the pharmacy branches and office we order TO, not
 # generic neighbourhoods. Every pincode below was confirmed against 1mg's own
@@ -25,7 +34,11 @@ PRESETS = [
      "im_store": "1404884"},
 ]
 
-DB_PATH = "bot.db"
+# Relative by default so a local run just works. On a hosted container the
+# filesystem is ephemeral -- point this at a mounted volume or every redeploy
+# wipes the saved branches, Instamart store ids and pick history.
+#   DB_PATH=/data/bot.db
+DB_PATH = os.getenv("DB_PATH", "bot.db")
 CACHE_TTL = 15 * 60      # seconds
 ADAPTER_TIMEOUT = 8.0    # per-platform HTTP timeout
 SEARCH_BUDGET = 10.0     # overall fan-out cap; render whatever arrived
