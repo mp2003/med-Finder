@@ -1,7 +1,7 @@
 # Platform Research & Endpoint Reference
 
 > All findings below were **verified with live requests**, not assumed.
-> Last full re-verification: **2026-08-31** (all 5 live adapters passing).
+> Last full re-verification: **2026-09-07** (all 7 live adapters passing).
 
 ## Why this document exists
 
@@ -134,13 +134,66 @@ Use **v2**: v1 returns `suggestionView` instead of `products`. National pricing
 | **BigBasket** | API live, returns `400 "Missing either Mid or AddressId or lat-long"`. Guessed lat/long cookies -> `404` error 5012 | Replicate the address/store-resolution call the site makes *before* search, then pass `Mid`/`AddressId` through |
 | **JioMart** | HTTP 200 but a 6.8MB Akamai-fronted shell, **no prices in HTML**. Algolia keys are *not* in the page shell (the one "algolia" hit is a config schema) | Bundle-grep for the Algolia credentials or JSON search endpoint |
 
+## The TLS-fingerprint finding (how Blinkit and Instamart were unblocked)
+
+Both were previously recorded here as blocked. That verdict was **wrong about the
+cause**, and the correction is worth keeping.
+
+Blinkit returned 403 to a curl carrying the *full browser cookie jar* -- identical
+headers, identical cookies, same 403. Cloudflare was not reading them: it rejects
+on the **TLS handshake fingerprint**, before a single header is parsed. `httpx`
+and `curl` do not negotiate like Chrome does.
+
+`curl_cffi`, which replays Chrome's real TLS fingerprint, gets **HTTP 200 from
+both -- with no cookies at all**. No session to warm, nothing to expire.
+
+```python
+from curl_cffi import requests as cffi
+async with cffi.AsyncSession() as s:
+    r = await s.post(URL, headers=h, data="{}", impersonate="chrome")
+```
+
+| Platform | What the block actually was | Key |
+|---|---|---|
+| **Blinkit** | TLS fingerprint only | `lat`/`lon` **headers** select the dark store |
+| **Instamart** | WAF on the *website*; the **API is open** | `storeId` query param, not derivable from lat/lon |
+| **Zepto** | Rotating `aws-waf-token` on the API host | Not beatable this way -- see below |
+
+Traps found while doing this:
+
+- Blinkit's `eta_identifier` is an internal class name (`express`, `unicorn`,
+  `longtail`), not minutes, and **varies by store**. No minutes exist anywhere in
+  the payload; `v1/actions/get_updated_eta` returns a merchant map that excludes
+  the pharmacy stores.
+- Instamart throttles as **HTTP 200 with a ~31-byte `{"statusCode":429}` body** --
+  it looks like success. Treated as "no results", absorbed by the cache.
+- Instamart's `storeId` **cannot** be resolved from coordinates. Each branch's id
+  was captured from its own web app and recorded in `config.PRESETS`. Ids differ
+  per branch and so do prices: the same query returned Double Masala at Rs 75
+  from one store and Rs 120 from another.
+
+## Product images
+
+Field paths, probed live; every constructed URL verified returning HTTP 200 with
+an `image/*` content-type.
+
+| Platform | Field | Form |
+|---|---|---|
+| 1mg, PharmEasy | `item["image"]` | already absolute |
+| Blinkit | `item["image"]["url"]` | already absolute |
+| Netmeds | first `medias[]` entry with `type == "image"` | already absolute |
+| Apollo | `item["thumbnail"]` | relative; prefix `https://newassets.apollo247.com/pub/media` |
+| Instamart | `variations[0].imageIds[0]` | prefix `https://media-assets.swiggy.com/swiggy/image/upload/` |
+| **DMart** | `sKUs[0].imageKey` | **unresolved** -- every CDN pattern tried 404s, and the product page 404s too |
+
+Not every product has an image even on a supporting platform, so the renderer
+walks the ranked results and takes the first that does.
+
 ## Blocked -- not pursued
 
 | Platform | Observed | Note |
 |---|---|---|
-| Blinkit | HTTP 403 | Needs warm per-location session (Phase 3) |
-| Zepto | HTTP 202, **empty body** | Store-id resolution first (Phase 3) |
-| Swiggy Instamart | HTTP 202, **empty body** | Phase 3; historically needs residential IP |
+| Zepto | `bff-gateway.zepto.com` returns 202/empty | See below -- the one that resisted `curl_cffi` |
 | Amazon.in | `bm-verify` bot challenge | Deliberate bot detection |
 | Meesho | HTTP 403 | |
 | Wellness Forever | HTTP 403 even with full browser headers | |
@@ -148,10 +201,36 @@ Use **v2**: v1 returns `suggestionView` instead of `products`. National pricing
 | Flipkart | Search returns electronics, not groceries; captcha infra in payload | Wrong shape for this bot |
 | PillO | `pillo.in` does not resolve; `pillo.co.in`/`pillo.app`/`trypillo.com` are **114-byte stubs**. Only `evitalrx.in` is real -- and it is *pharmacy billing software*, not a consumer storefront | No public web catalog exists. Would require reverse-engineering the mobile app |
 
-**Policy:** the blocked platforms return 403s and bot-challenges. Working around
-those means evading protection, which is out of scope for this project. They stay
-unbuilt unless reached the way the spec intends -- a real browser session with
-proper geolocation (Phase 3).
+### Zepto -- why re-capturing will not help
+
+Worth recording so this is not retried from scratch. The app talks to a separate
+host from the WAF-challenged website:
+
+```
+POST https://bff-gateway.zepto.com/user-search-service/api/v3/search
+GET  https://bff-gateway.zepto.com/lms/api/v2/get_page?latitude=&longitude=
+     (the store resolver -- takes raw lat/lon, which is what we would need)
+```
+
+That host answers **202 with an empty body** for every combination tried:
+minimal headers, `+aws-waf-token` cookie, `+request-signature`/CSRF headers, and
+the full captured header set. Replaying a browser-captured curl **verbatim**
+(plain curl, every header and cookie) also returned 202/0 bytes.
+
+The reason: two requests captured within one browser session carried **different**
+`aws-waf-token` values, and the token's middle segment decodes to a 12-byte
+structure holding a timestamp. It rotates and is short-lived, so it cannot be
+lifted from a capture and reused by a bot -- unlike Blinkit's static `auth_key`.
+
+Dark stores are UUIDs in `store_id`/`store_ids`, and `store_etas` gives real
+minutes (`{"...1b2":8,"...1f6":24}`) -- better data than Blinkit's class names,
+if it is ever reachable. Product pages are constructible from the search
+response: `zepto.com/pn/<slug>/pvid/<uuid>`.
+
+**Policy:** the remaining blocked platforms return bot-challenges. Working around
+those means evading protection, which is out of scope. They stay unbuilt unless
+reached the way the spec intends -- a real browser session with proper
+geolocation (Phase 3), which can solve the challenge and keep tokens fresh.
 
 ## Credentials note
 

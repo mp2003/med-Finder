@@ -141,3 +141,52 @@ instead of re-showing the picker.
 messages, each producing three replies. Reduced first-run to 2 messages and
 repeat to 1. The remaining 2-message split is a Telegram constraint: inline
 buttons and `request_location` buttons cannot share one message.
+
+## D11 — `curl_cffi` for Blinkit and Instamart, not a scraping vendor
+
+**Considered:** ScrapeGraphAI and QuickCommerceAPI, both paid.
+
+ScrapeGraphAI solves bot walls but not geolocated dark-store sessions, and its
+LLM extraction cannot promise a real price -- which the adapter contract forbids
+inventing. QuickCommerceAPI fit the shape well (lat/lon in, structured fields
+out) but is resold scraping: no vendor in that category has an official
+Blinkit/Zepto/Instamart API. Rs 500/month effective floor via 30-day credit
+expiry, and an unverifiable dependency.
+
+**Chosen:** `curl_cffi`, one free dependency. Both platforms answer 200 to
+Chrome's TLS fingerprint with no cookies. The paid option became redundant once
+we had more coverage than it offered.
+
+## D12 — Instamart store ids recorded per branch, not resolved
+
+`storeId` cannot be derived from lat/lon and the resolution handshake was not
+cracked. Ids were captured from Instamart's own web app and written into
+`config.PRESETS`.
+
+**Trade-off, stated plainly:** a shared live location has no id and falls back to
+a default store, where availability is approximate. Presets are exact. Ids can
+also go stale if Instamart reassigns stores -- config carries a note to
+re-capture if a branch's stock stops matching the app.
+
+## D13 — Board rendered once, not progressively
+
+The board used to be re-rendered on every adapter that landed. With seven
+platforms that is seven rewrites, and rows reshuffle under the reader as
+rankings change. A single static notice now stands until every platform has
+answered.
+
+Costs up to ~10s before anything appears. Accepted: a stable answer beats a
+twitching one, and the budget was already 10s.
+
+## D14 — A word-ratio parser, not a clinical NER model
+
+Med7, scispaCy, BioBERT and MedEx were all evaluated for extracting item names.
+All rejected. They are trained on discharge summaries in medical English with
+US/UK drug names; the input here is WhatsApp shorthand with Indian brands
+("Vigoquin", "Amplinak") and pharmacy abbreviations ("E/d."). A model trained on
+"patient prescribed 500mg amoxicillin PO BID" does not recognise
+`Amplinak     E/d.`, and it adds ~500MB plus a slow model load.
+
+The actual problem is separating chatter from item lines. A ratio of request
+words to real words does that in ~40 lines with no dependency, and classified
+all six test shapes correctly.

@@ -20,9 +20,12 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m adapters.pharmeasy
 .venv/bin/python -m adapters.netmeds
 .venv/bin/python -m adapters.dmart
+.venv/bin/python -m adapters.blinkit    # curl_cffi; TLS-impersonated
+.venv/bin/python -m adapters.instamart  # curl_cffi; throttles hard
+.venv/bin/python -m parsing             # order-message extraction
 
-# Check all five (keep stderr; a redirected-output loop can misreport status)
-for a in onemg apollo pharmeasy netmeds dmart; do
+# Check all seven (keep stderr; a redirected-output loop can misreport status)
+for a in onemg apollo pharmeasy netmeds dmart blinkit instamart; do
   printf "%-10s " $a
   .venv/bin/python -m adapters.$a 2>&1 | tail -1
 done
@@ -35,30 +38,39 @@ working URL. Run the relevant adapter's self-check after touching it.
 **These hit live third-party APIs.** Running them back-to-back gets you
 throttled, and a throttled adapter fails with the same
 `AssertionError: no results (endpoint likely re-pointed)` as a genuinely broken
-one. Before concluding an endpoint changed, pause ~20s and retry, or confirm with
-a direct `curl`. Space the checks out rather than looping them.
+one — so a red check is not evidence an endpoint changed. Pause ~20s and retry,
+or confirm with a direct `curl`, before concluding anything. Space the checks out
+rather than looping them.
 
 ## Architecture
 
 A Telegram bot (python-telegram-bot, long polling) that fans a product query out
 to several Indian pharmacy/FMCG platforms concurrently and renders one comparison
-board, editing the message as each platform lands.
+board once every platform has answered.
 
 ```
-bot.py::do_search
-  → db.get_location(chat_id)        SQLite, survives restarts
-  → cache check                     key=(normalized_query, pincode), TTL 15min
-  → asyncio.gather over ADAPTERS    10s total budget, 8s per adapter
-  → matching identity gate + score  drop wrong-brand results
-  → render()                        progressive message edits
+bot.py::ask_urgency                 1 item -> search; 2+ -> order-list flow
+  → bot.py::do_search
+      → db.get_location(chat_id)    SQLite, survives restarts
+      → cache check                 key=(normalized_query, pincode), TTL 15min
+      → fan out over ADAPTERS       10s total budget, 8s per adapter
+      → identity gate + typo gate   drop wrong brands, flag near-misses
+      → ONE final message           photo + caption + supplier buttons
 ```
+
+**Order lists.** `parsing.extract_items` turns a human message ("sir can u please
+order dolo, eno and colgate") into items. Two or more takes the list flow:
+confirm → one ranking question → search each item → `complete_baskets` finds
+platforms carrying *everything*, because one order beats three. No complete
+basket means an item-by-item walk with a recorded pick each.
 
 **The adapter contract** is the core abstraction. Each `adapters/<platform>.py`
 exposes `PLATFORM: str` and `async def search(query, loc) -> list[ProductResult]`,
 and must:
 
 - **Never raise.** Catch everything, log with the first 500 chars of the response
-  body, return `[]`. One broken platform renders `⚠️`; the board still works.
+  body, return `[]`. One broken platform is summarised as "not stocked"; the
+  board still works.
 - End by returning `top_matches(query, out)` — this applies the identity gate,
   ranking and the 3-result cap. Do not hand-roll filtering.
 - Set `eta=None` when the platform gives no delivery estimate. **Never synthesize
@@ -68,13 +80,26 @@ and must:
 
 Adding a platform: write the module, add its name to `_LIVE` in
 `adapters/__init__.py`. Nothing else changes. `_SOON` holds stubs, which are
-excluded from the fan-out and rendered `⚠️ coming soon` — a stub returning `[]`
-would otherwise render as a misleading `❌ not found`.
+excluded from the fan-out and listed under "Not yet supported" — a stub returning
+`[]` would otherwise be reported as genuinely not stocked.
 
 `adapters/__init__.py` builds the registry lazily via module `__getattr__` so
 `python -m adapters.<name>` does not trip runpy's double-import warning.
 
-## Two things that will bite you
+## Persistence
+
+`db.py` holds two tables in `bot.db`:
+
+- **`users`** — one saved location per chat. `init()` runs `ALTER TABLE` in a
+  `try/except` because `CREATE TABLE IF NOT EXISTS` will not add a column to an
+  existing DB; that is how `im_store` reached older files. Add future columns the
+  same way.
+- **`picks`** — which supplier was chosen for an item (`save_pick` /
+  `recent_pick`). Telegram **never reports a tap on a `url=` button**, so a
+  choice can only be known by asking — this is where the answer lives. Order
+  history, so rows accumulate; not a cache.
+
+## Four things that will bite you
 
 **1. A 200 response is not success.** 1mg and Apollo search pages, and several
 guessed API paths, return the full HTML *page shell* via a catch-all rewrite
@@ -87,33 +112,77 @@ found by grepping the sites' own JS bundles and confirmed with curl —
 
 **2. Fuzzy scoring alone shows wrong brands as confident matches.** `rapidfuzz`
 `token_set_ratio` rewards generic words, so a "Cristello face wash" query scored
-a *Glutafine* product at 70 and rendered it `✅`. `matching.py` therefore layers
-an **identity gate** over the score: `key_tokens()` strips ~60 generic retail
+a *Glutafine* product at 70 and presented it as a confident hit. `matching.py`
+therefore layers an **identity gate** over the score: `key_tokens()` strips ~60 generic retail
 words (`tablet`, `face`, `wash`, `mg`, `brightening`…), and `identity_ok()`
 requires **every** remaining token to appear in the title. `normalize()` also
 splits punctuation and letter/digit runs, because Apollo writes `Dolo-650` (one
 token, scored 42.9 — below the cutoff) while the wrong `Dolo 500` scored 66.7.
 
-Consequence: matching is deliberately strict. A typo reports not-found-with-
-similar rather than guessing. Tune via `_GENERIC` in `matching.py`, and re-check
-that a wrong-brand query still fails before committing.
+Consequence: matching is deliberately strict. Tune via `_GENERIC` in
+`matching.py`, and re-check that a wrong-brand query still fails before
+committing.
+
+**A score threshold cannot separate a typo from a wrong brand — this was tried
+and discarded.** Scores overlap: a wrong brand ("O3+ Brightening Face Wash" for a
+Cristello query) scored **91.3** while a real typo match scored **70.8**.
+`typo_ok()` uses Levenshtein distance on the identifying tokens instead — a typo
+is one edit from the brand, a wrong brand is a different word. Digits still need
+exact matches, so 650 never becomes 500.
+
+**3. A block is not always what it looks like.** Blinkit and Instamart were
+recorded as blocked for weeks on the strength of a 403 and a 202. Both were
+wrong about the *cause*: Cloudflare rejects on **TLS handshake fingerprint**
+before reading a single header, which is why a curl carrying the full browser
+cookie jar still got 403. `curl_cffi` with `impersonate="chrome"` gets 200 from
+both, with **no cookies at all**. Before concluding a platform is unreachable,
+check whether the rejection even depends on what you sent.
+
+Instamart also throttles as **HTTP 200 with a ~31-byte `{"statusCode":429}`
+body** — it looks like success and parses as empty.
+
+**4. Only one bot process may poll at a time.** Telegram allows a single
+`getUpdates` consumer per token; a second instance evicts the first every few
+seconds, and both log `Conflict: terminated by other getUpdates request`. If you
+are already running the bot in a terminal, do not start another — check first:
+
+```bash
+ps -eo pid,etime,command | grep "[b]ot.py"
+```
+
+`on_error` logs this once rather than every poll, so a quiet log does not mean
+only one is running.
 
 ## Result semantics
 
-`render()` distinguishes three states, and the distinction is the point:
+`_bucket()` splits the fan-out five ways, and the distinctions are the point:
 
-| State | Rendering |
+| Bucket | Rendering |
 |---|---|
-| `is_match` + available | `✅ Platform — ₹32.1 (eta) — link` |
-| `is_match` + out of stock | `❌ … is out of stock` + `↳ in stock:` alternative |
-| `is_match=False` | `❌ … not found. Similar: <product>` |
+| in stock | best one written out as `BEST OPTION`; rest become buttons |
+| carried, out of stock | "Carried but out of stock at X" — distinct from not-stocked |
+| near-match (`typo_ok`) | `CLOSEST MATCH` + "check the name before ordering" |
+| no result / failed | folded into one "Not stocked at …" line |
+| coming soon | "Not yet supported: …" |
 
-Suggestions must never render as `✅`. Product names are `html.escape`d
-(`parse_mode="HTML"`; pharmacy titles contain `&` and `'`).
+A near-match must never be presented as the recommendation when an exact match
+exists. Product names are `html.escape`d (`parse_mode="HTML"`; pharmacy titles
+contain `&` and `'`).
 
-**Caveat worth preserving:** only 1mg varies by location. Apollo's price,
-PharmEasy, Netmeds and DMart are national, so `✅` means "in stock", not
-"deliverable to this pincode". Do not write copy that claims otherwise.
+**No emojis in user-facing copy.** Deliberate, and easy to reintroduce by
+habit — `grep -nP '[\x{1F300}-\x{1FAFF}\x{2600}-\x{27BF}]' bot.py parsing.py`
+should stay empty.
+
+**The board is one photo message** carrying caption and buttons, so captions cap
+at **1024 characters** (text allows 4096) and a text message cannot be edited
+into a photo one. `render()` trims trailing summary lines to fit but never the
+recommendation itself.
+
+**Caveat worth preserving:** location accuracy is split. Blinkit (lat/lon) and
+Instamart (per-branch `storeId`) are genuinely store-scoped; 1mg is city-scoped;
+**Apollo's price, PharmEasy, Netmeds and DMart are national**, so for those "in
+stock" means "in stock somewhere", not "deliverable to this branch". Do not
+write copy that claims otherwise.
 
 ## Config and secrets
 
@@ -121,19 +190,50 @@ PharmEasy, Netmeds and DMart are national, so `✅` means "in stock", not
 `MIN_MATCH_SCORE`, `MAX_RESULTS`. Presets need **both** `city` and `pincode` —
 1mg keys on city (use its spelling, `"Bangalore"`), Apollo on pincode.
 
+They also need **`im_store`**, Instamart's dark-store id, which **cannot be
+derived from lat/lon**: set the branch address on instamart.in and read
+`storeId=` out of any request. A preset without one silently falls back to a
+default store, so that branch's Instamart stock is somebody else's.
+
 `.env` holds `BOT_TOKEN` only. The 1mg/Apollo tokens hardcoded in the adapters
 are public web-client constants shipped in those sites' own JS bundles, not user
 secrets — that placement is deliberate.
 
+## Git identity
+
+Three identities, and they do not agree by default:
+
+```bash
+git config user.email          # this repo: personal (repo-local override)
+git config --global user.email # everywhere else: work
+gh auth status                 # which account PUSHES
+```
+
+The repo-local override keeps commits personal without touching the global work
+identity. But `gh` is **global** — pushing while the work account is active fails
+on permissions even though the commits are authored correctly. Fix:
+
+```bash
+gh auth switch --user mp2003
+```
+
+`git config` decides the name recorded in the commit; `gh auth` decides which
+account authenticates the push. They are independent.
+
 ## Scope
 
-Blinkit/Zepto/Instamart return 403 / 202-empty; Amazon serves a bot challenge.
-These stay unbuilt — the legitimate route is the spec's Phase 3 (a real browser
-session with geolocation), not working around bot protection. BigBasket and
-JioMart are reachable but need a store handshake / bundle-grep respectively.
+**Blinkit and Instamart are live** — see trap 3 above; the block was TLS
+fingerprinting, not session state.
+
+Still unbuilt: **Zepto** (its API host rotates a short-lived `aws-waf-token`;
+replaying a captured curl verbatim still returns 202/empty, so re-capturing does
+not help) and **Amazon** (bot challenge). The legitimate route for those is the
+spec's Phase 3 — a real browser session with geolocation — not working around bot
+protection. BigBasket and JioMart are reachable but need a store handshake /
+bundle-grep respectively.
 
 Out of scope: ordering or checkout automation, prescription handling, price
-history, alerts.
+history, alerts, OCR of forwarded images, quantity handling.
 
 ## Documentation
 

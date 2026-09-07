@@ -17,9 +17,9 @@ pharmacy and FMCG platforms.
 
 The repo-root `README.md` is the 10-line quickstart. This set is the depth.
 
-## Current state — 2026-08-31
+## Current state — 2026-09-07
 
-**5 platforms live**, all re-verified today:
+**7 platforms live**, all re-verified today:
 
 | Platform | Type | Auth | Location-aware |
 |---|---|---|---|
@@ -28,10 +28,16 @@ The repo-root `README.md` is the 10-line quickstart. This set is the depth.
 | PharmEasy | pharmacy | none | ✗ national |
 | Netmeds | pharmacy | none | ✗ national |
 | DMart Ready | FMCG | none | ✗ national |
+| Blinkit | quick-commerce | bundle token | ✅ lat/lon -> dark store |
+| Swiggy Instamart | quick-commerce | none | ✅ per-branch storeId |
 
-Stubbed: BigBasket, JioMart. Blocked: Blinkit, Zepto, Instamart, Amazon, Meesho.
+Stubbed: BigBasket, JioMart. Blocked: Zepto, Amazon, Meesho.
 
-~960 lines of Python, 5 runtime dependencies, single-file SQLite.
+Blinkit and Instamart were previously recorded as blocked. The block was
+**TLS fingerprinting**, not session state -- `curl_cffi` clears both with no
+cookies at all. → [03](03-platform-research.md)
+
+~6 runtime dependencies, single-file SQLite.
 
 ## The three things worth knowing
 
@@ -41,8 +47,9 @@ Stubbed: BigBasket, JioMart. Blocked: Blinkit, Zepto, Instamart, Amazon, Meesho.
    before a parser was written. → [03](03-platform-research.md)
 
 2. **Fuzzy matching alone shows wrong brands as confident matches.** A
-   "Cristello" query returned a Glutafine product with a `✅`. Scoring now
-   requires the query's identifying tokens to actually appear.
+   "Cristello" query returned a Glutafine product as a confident hit. Scoring now
+   requires the query's identifying tokens to actually appear -- and a one-letter
+   typo is separated from a wrong brand by edit distance, not by score.
    → [B2](05-bugs-and-fixes.md#b2)
 
 3. **A `✅` currently means "in stock", not "deliverable to your pincode"** on

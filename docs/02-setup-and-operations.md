@@ -57,7 +57,7 @@ Everything an owner edits is in `config.py`:
 
 | Constant | Default | Meaning |
 |---|---|---|
-| `PRESETS` | 5 Bengaluru locations | Each needs `name`, `lat`, `lon`, `pincode`, **`city`** |
+| `PRESETS` | 3 delivery destinations | Each needs `name`, `lat`, `lon`, `pincode`, **`city`**, and `im_store` for exact Instamart stock |
 | `CACHE_TTL` | 900s | In-process cache lifetime |
 | `ADAPTER_TIMEOUT` | 8.0s | Per-platform HTTP timeout |
 | `SEARCH_BUDGET` | 10.0s | Overall fan-out cap |
@@ -66,7 +66,17 @@ Everything an owner edits is in `config.py`:
 
 **Adding a preset:** use the platform's own city spelling -- `"Bangalore"`, not
 `"Bengaluru"`. Both `city` and `pincode` are required (1mg keys on city, Apollo
-on pincode).
+on pincode). Blinkit uses `lat`/`lon` directly, so verify those resolve -- 1mg's
+`resolve_latlng` is a free check that the coordinates match the postal pincode.
+
+`im_store` is Instamart's dark-store id and **cannot be derived from
+coordinates**: set the branch address on instamart.in, then read `storeId=` out
+of any request. Without it that branch falls back to a default store and its
+availability is approximate. Re-capture if a branch's stock stops matching the
+app -- Instamart reassigns stores.
+
+Presets are the pharmacy branches and office that stock is delivered **to**, not
+generic neighbourhoods. Every pincode was confirmed against 1mg's own resolver.
 
 ## Health checks
 
@@ -78,6 +88,8 @@ Each adapter self-checks against its live endpoint:
 .venv/bin/python -m adapters.pharmeasy
 .venv/bin/python -m adapters.netmeds
 .venv/bin/python -m adapters.dmart
+.venv/bin/python -m adapters.blinkit    # needs curl_cffi
+.venv/bin/python -m adapters.instamart  # needs curl_cffi; throttles hard
 ```
 
 Each prints its top results and asserts at least one priced result with a working
@@ -87,9 +99,9 @@ URL. **This is the fastest way to tell whether a platform changed its API.**
 > throttled, and a throttled adapter raises the *same* "no results" assertion as
 > a re-pointed endpoint. Pause and retry before concluding an API changed.
 
-Run all five:
+Run all seven:
 ```bash
-for a in onemg apollo pharmeasy netmeds dmart; do
+for a in onemg apollo pharmeasy netmeds dmart blinkit instamart; do
   printf "%-10s " $a
   .venv/bin/python -m adapters.$a >/dev/null 2>&1 && echo OK || echo FAIL
 done

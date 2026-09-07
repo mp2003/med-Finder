@@ -27,7 +27,7 @@ async def demo():
     assert any(r.price and r.url.startswith("http") for r in res)
 ```
 
-This is the canary for API changes. Run all five after any platform-side breakage
+This is the canary for API changes. Run all seven after any platform-side breakage
 (see [02-setup-and-operations.md](02-setup-and-operations.md#health-checks)).
 
 ## What each check covers
@@ -36,13 +36,21 @@ This is the canary for API changes. Run all five after any platform-side breakag
 [B2](05-bugs-and-fixes.md#b2):
 - `cristello ...` -> `is_match=False` on both pharmacy platforms (wrong brand
   must never render `✅`)
-- `dolo 650` -> correct brand, `is_match=True` on all four pharmacy platforms
+- `dolo 650` -> correct brand, `is_match=True` on the pharmacy platforms
+- A one-letter typo (`BIODEMS-F` for the real `BIODENS-F`) -> `CLOSEST MATCH`,
+  never a confident hit. Score cannot separate these; edit distance can
 - DMart is excluded from the medicine assertion -- it is a grocery store and
   correctly has no medicines
 
 **Render** -- exercises every board state:
-live results · partial (one platform still checking) · one platform failed
-(`⚠️` must not break the others) · nothing found · cached footer.
+several hits · single hit · near-match only · out of stock · nothing anywhere ·
+a platform that failed (must not break the others). Also asserts the caption
+stays within Telegram's 1024-character limit with a deliberately long name.
+
+**Parsing** -- `python -m parsing` asserts all six message shapes: inline prose,
+numbered-inline, numbered-multiline, a forwarded list with chatter, a single
+product, and a bare greeting yielding nothing. Plus that `search_term` strips a
+strength (`Vigoquin 0.5%` -> `Vigoquin`) while keeping brand digits (`Dolo 650`).
 Also asserts no unescaped `&` survives, and that `15's` renders as `&#x27;`.
 
 **Budget** -- injects a deliberately hung adapter and asserts:
@@ -60,17 +68,17 @@ it survives. Covers the "location survives restart" acceptance criterion.
 |---|---|
 | `/start` shows presets; tapping saves and confirms | ✅ |
 | Location survives restart (SQLite) | ✅ verified in a fresh process |
-| `dolo 650` returns a board <10s with 1mg name/price/link | ✅ ~0.7s for five platforms |
+| `dolo 650` returns a board <10s with name/price/link | ✅ within the 10s budget for seven platforms |
 | `/location` switches; next search uses the new one | ✅ price and ETA both change |
-| A failing platform shows `⚠️` without breaking others | ✅ |
+| A failing platform is summarised without breaking others | ✅ |
 | Runs with `pip install -r requirements.txt && python bot.py` | ✅ verified from a clean venv |
 
 ## Known gaps
 
-- **The Telegram UI itself is not automated.** Handlers, keyboards and streaming
-  edits are verified at the render level with fake update objects, not against
-  the real client. `/start`, button taps and progressive edits were confirmed by
-  hand.
+- **The Telegram UI itself is not automated.** Handlers, keyboards and the
+  photo-with-caption board are verified at the render level with fake update
+  objects, not against the real client. `/start`, button taps and the order-list
+  flow were confirmed by hand.
 - **No mocked-endpoint tests.** Every check hits live platforms, so they fail if
   the network is down or a site is having a bad day. Deliberate: the failure mode
   we actually care about *is* the live endpoint changing.
@@ -79,8 +87,11 @@ it survives. Covers the "location survives restart" acceptance criterion.
 ## Manual smoke test
 
 1. `/start` -> pick a preset -> confirms name + pincode
-2. `dolo 650` -> four pharmacy platforms with prices and working links
-3. `maggi noodles` -> DMart returns; pharmacy platforms say not-found
-4. A junk brand (`cristello face wash`) -> `not found` + labelled `Similar:`
-5. `/where` -> saved location; Ctrl-C, restart, `/where` again -> still there
-6. `/location` -> switch preset -> re-search -> ETA/price differ
+2. `dolo 650` -> pick a ranking -> one board: image on top, BEST OPTION block,
+   supplier buttons underneath
+3. `maggi noodles` -> DMart and quick-commerce return; pharmacy says not-found
+4. A junk brand (`cristello face wash`) -> not found, no result promoted
+5. `sir can u please order dolo 650, eno and colgate` -> confirmation list ->
+   one ranking question -> a complete basket, or an item-by-item walk
+6. `/where` -> saved location; Ctrl-C, restart, `/where` again -> still there
+7. `/location` -> switch branch -> re-search -> ETA/price differ

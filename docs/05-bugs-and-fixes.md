@@ -169,3 +169,53 @@ class of bug fails the health check instead of hiding.
   the checks back-to-back**, not API changes; all recovered after a ~20s pause.
   A throttled adapter raises the *same* assertion as a re-pointed endpoint, so
   always pause and retry before concluding drift.
+
+## B8 — "Vigoquin 0.5%" reported not-found on a product that exists
+
+**Symptom.** An extracted item with a strength failed to match a real listing.
+
+**Cause.** `identity_ok` requires digits to match a whole token, and
+`Vigoquin 0.5%` yields key tokens `['vigoquin', '0', '5']`. Verified:
+
+| Query | Title | Matches? |
+|---|---|---|
+| `Vigoquin 0.5%. E/d` | Vigoquin 0.5% Eye Drop 5ml | yes |
+| `Vigoquin 0.5%. E/d` | **Vigoquin Eye Drops** | **no** |
+| `Vigoquin` | Vigoquin 0.5% Eye Drop 5ml | yes |
+
+**Fix.** `parsing.search_term` strips a percentage strength and trailing dosage
+form for the *search* while the confirmation list keeps the original line. Brand
+digits survive -- `Dolo 650` keeps its 650, because there the digits identify the
+product rather than its strength.
+
+## B9 — A typo reported not-found on the right product
+
+**Symptom.** Searching `BIODEMS-F 10 HAIR LOTION 60ML` (one letter off the real
+`BIODENS-F`) returned "not found" from every platform, including one showing the
+exact product at Rs 1024.50.
+
+**Cause.** The identity gate demands exact token containment, so `biodems` failed
+against `biodens...` despite scoring 96.7.
+
+**Fix that did NOT work.** A score threshold. Scores overlap badly --
+`token_set_ratio` rewards shared generic words, so a *wrong* brand ("O3+
+Brightening Face Wash" for a Cristello query) scored **91.3** while a real typo
+match scored **70.8**. No cutoff separates them; this was tested and discarded.
+
+**Fix.** `matching.typo_ok` uses Levenshtein distance on the *identifying*
+tokens: a typo is one edit from the brand, a wrong brand is a different word.
+Digits still require exact matching, so 650 never becomes 500. Renders as
+`CLOSEST MATCH`, never a confident hit.
+
+## B10 — Blinkit's internal delivery labels leaked into the UI
+
+**Symptom.** Buttons read `Blinkit  Rs 31  unicorn`.
+
+**Cause.** Blinkit ships an `eta_identifier` class name rather than minutes, and
+it **varies by store** -- `express` at one branch, `unicorn` at another. The
+first fix only knew `express`, so `unicorn` scored as an unknown ETA and sorted
+Blinkit *last* under "soonest delivery" despite being fastest.
+
+**Fix.** `_FAST_WORDS` covers the quick-commerce vocabulary and renders "under
+30 min". `longtail` and `pharma_rx` are catalogue tags, not speeds, so they show
+no ETA rather than being dressed up as a delivery promise.
