@@ -48,7 +48,13 @@ def key_tokens(query: str) -> list[str]:
     """The tokens that actually identify the product -- brand/molecule/strength.
     Pure digits count (650, 500); generic retail words don't."""
     toks = normalize(query).split()
-    keep = [t for t in toks if t not in _GENERIC and (len(t) > 2 or t.isdigit())]
+    # No length filter: Indian brands are routinely distinguished by a one- or
+    # two-letter suffix, and dropping it merges different drugs. "Pan-D" became
+    # "pan", which matched a frying pan on Instamart; "Ecosprin AV" became
+    # "Ecosprin" and "B12" became "12". Short generic words are already listed
+    # in _GENERIC (mg, ml, kg, s, x, of), so the filter was redundant as well
+    # as destructive.
+    keep = [t for t in toks if t not in _GENERIC]
     return keep or toks  # never return empty: an all-generic query keeps its words
 
 
@@ -72,6 +78,12 @@ def _word_aligned(tok: str, title_words: list[str]) -> bool:
     What is NOT accepted is a multi-word run that overshoots a boundary, so
     the glued path cannot invent matches the prefix rule would have refused.
     """
+    # A one- or two-letter token must match a WHOLE word. As a prefix it is
+    # nearly free -- "d" starts "dosa" and "digestive", which is how a Pan-D
+    # query reached a dosa tawa and a mouth freshener. Longer tokens keep the
+    # prefix rule, which is what lets "paracetamol" match a longer title.
+    if len(tok) <= 2:
+        return tok in title_words
     if any(w.startswith(tok) for w in title_words):
         return True
     for i in range(len(title_words)):
@@ -204,6 +216,27 @@ def demo():
     assert respell("zzzzzzz", tt) is None, "guessed at an unrelated query"
     # Digits are never respelt: 650 and 500 are one edit apart.
     assert respell("dolo 650", ["Dolo 500 Tablet"]) is None
+
+    # A one- or two-letter suffix IS the brand in Indian pharma: Pan-D is not
+    # Pan 40, Ecosprin AV is not Ecosprin, Shelcal HD is not Shelcal. Dropping
+    # it merged them, and "Pan-D" -> "pan" matched a frying pan on Instamart.
+    assert key_tokens("Pan-d") == ["pan", "d"]
+    assert not identity_ok("Pan-d", "Bergner Stainless Steel Frying Pan")
+    assert not identity_ok("Pan-d", "Pan 40 Tablet")
+    assert identity_ok("Pan-d", "Pan D Tablet")
+    assert not identity_ok("Ecosprin AV", "Ecosprin 75 Tablet")
+    assert identity_ok("Ecosprin AV", "Ecosprin-AV 75 Capsule")
+    assert not identity_ok("Shelcal HD", "Shelcal 500 Tablet")
+    assert key_tokens("B12") == ["b", "12"], "lost the brand letter"
+    # Generic noise is still stripped -- that is _GENERIC's job, not length.
+    assert key_tokens("Crocin 650 mg strip of 15") == ["crocin", "650", "15"]
+
+    # A single-letter token as a PREFIX matches almost anything: "d" starts
+    # "dosa" and "digestive", which sent a Pan-D query to a dosa tawa and a
+    # mouth freshener. Short tokens must match a whole word.
+    assert not identity_ok("Pan-d", "Cast Iron Grill Pan Dosa Tawa")
+    assert not identity_ok("Pan-d", "Praakritik Natural Pan Mukhwas Digestive Aid")
+    assert identity_ok("Pan-d", "Pan-D Capsule 15's")
 
     # A look-alike drug one edit away may widen the SEARCH, but must never be
     # presented as the confident match: lasix/lanix are different drugs.
