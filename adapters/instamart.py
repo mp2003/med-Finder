@@ -24,7 +24,7 @@ import logging
 
 from curl_cffi import requests as cffi
 
-from adapters.base import Location, ProductResult, top_matches
+from adapters.base import Location, ProductResult, top_matches, why
 from config import ADAPTER_TIMEOUT
 from matching import score
 
@@ -120,7 +120,8 @@ async def search(query: str, loc: Location) -> list[ProductResult]:
         return top_matches(query, out)
     except Exception as e:
         body_txt = r.text[:500] if r is not None else ""
-        log.warning("%s search failed for %r: %s %s", PLATFORM, query, e, body_txt)
+        log.warning("%s search failed for %r: %s %s",
+                    PLATFORM, query, why(e), body_txt)
         return []
 
 

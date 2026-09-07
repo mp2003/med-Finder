@@ -54,6 +54,17 @@ def make_client(**kw) -> httpx.AsyncClient:
                              follow_redirects=True, **kw)
 
 
+def why(e: Exception) -> str:
+    """Readable cause for an adapter failure.
+
+    httpx's timeout and connection errors carry an EMPTY message, so the
+    obvious `log.warning(..., e)` prints "search failed for 'x': " and tells
+    you nothing -- in particular it cannot be told apart from a re-pointed
+    endpoint, which needs a completely different fix. Always name the class.
+    """
+    return f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+
+
 def strip_tags(s: str | None) -> str | None:
     """1mg's eta ships as HTML ('Get by <b><span ...>7pm, Tomorrow</span></b>').
     Raw, it corrupts Telegram's parse_mode=HTML message."""

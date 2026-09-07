@@ -96,7 +96,8 @@ async def search(query: str, loc: Location) -> list[ProductResult]:
         return top_matches(query, out)
     except Exception as e:
         body = r.text[:500] if r is not None else ""
-        log.warning("%s search failed for %r: %s %s", PLATFORM, query, e, body)
+        log.warning("%s search failed for %r: %s %s",
+                    PLATFORM, query, why(e), body)
         return []
 
 

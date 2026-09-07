@@ -67,7 +67,8 @@ async def search(query: str, loc: Location) -> list[ProductResult]:
             body = r.text[:500]  # helps re-point selectors later
         except Exception:
             pass
-        log.warning("%s search failed for %r: %s %s", PLATFORM, query, e, body)
+        log.warning("%s search failed for %r: %s %s",
+                    PLATFORM, query, why(e), body)
         return []
 
 
